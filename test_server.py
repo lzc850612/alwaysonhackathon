@@ -481,6 +481,102 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(any("starts in 5 min" in x for x in texts))
         self.assertTrue(any("is live" in x for x in texts))
 
+    # ---------- finish → demo stage ----------
+
+    def shipped_team(self, prefix):
+        owner, mate = self.signup(f"{prefix}own"), self.signup(f"{prefix}mate")
+        ch = self.live_challenge(owner)
+        tid = owner.ok("/teams", {"challenge_id": ch["id"], "name": f"{prefix} team"})["team"]["id"]
+        rid = owner.ok(f"/teams/{tid}/invite", {"user_id": mate.ok("/me")["user"]["id"]})["request_id"]
+        mate.ok(f"/requests/{rid}", {"action": "accept"})
+        return owner, mate, tid
+
+    def test_finish_closes_roster_and_requires_submission(self):
+        owner, mate, tid = self.shipped_team("fin15")
+        hopeful = self.signup("hopeful15")
+        hopeful.ok(f"/teams/{tid}/join", {"message": "me too"})
+        self.assertEqual(hopeful.call(f"/teams/{tid}/finish", {})[0], 403)  # members only
+        self.assertEqual(mate.call(f"/teams/{tid}/finish", {})[0], 400)  # no submission yet
+        self.assertEqual(owner.call(f"/teams/{tid}/stage/start", {})[0], 400)  # can't go live before finishing
+        # Any member can finish — not just the owner.
+        r = mate.ok(f"/teams/{tid}/finish", {"title": "Shipit", "description": "Done", "repo_url": "https://github.com/x/y"})
+        self.assertEqual(r["withdrawn"], 1)
+        team = owner.ok(f"/teams/{tid}")["team"]
+        self.assertEqual((team["status"], team["open"]), ("shipped", False))
+        self.assertEqual(owner.ok(f"/teams/{tid}")["submission"]["title"], "Shipit")
+        self.assertEqual(hopeful.call(f"/teams/{tid}/join", {})[0], 409)
+        self.assertNotIn(tid, [t["id"] for t in hopeful.ok("/teams?open=1")["teams"]])
+        self.assertNotIn(tid, [t["id"] for t in hopeful.ok("/match/teams")["teams"]])
+        self.assertTrue(any("closed the roster" in n["text"] for n in hopeful.ok("/notifications")["notifications"]))
+        self.assertTrue(any("demo stage is ready" in n["text"] for n in owner.ok("/notifications")["notifications"]))
+        self.assertEqual(owner.call(f"/teams/{tid}/finish", {})[0], 409)
+        self.assertEqual(hopeful.call(f"/teams/{tid}/reopen", {})[0], 403)
+        mate.ok(f"/teams/{tid}/reopen", {})
+        self.assertEqual(owner.ok(f"/teams/{tid}")["team"]["status"], "building")
+
+    def test_demo_stage_live_lifecycle(self):
+        owner, mate, tid = self.shipped_team("stg16")
+        owner.ok(f"/teams/{tid}/finish", {"title": "Live thing", "demo_url": "https://example.com"})
+        viewer, other = self.signup("viewer16"), self.signup("other16")
+        p1, p2, v1, v2 = "presenter-one-1", "presenter-two-2", "viewer-session-1", "viewer-session-2"
+        # Not live yet: viewers wait, presenters can set up.
+        self.assertFalse(viewer.ok(f"/teams/{tid}/stage/heartbeat", {"session": v1})["live"])
+        owner.ok(f"/teams/{tid}/stage/heartbeat", {"session": p1, "screen": True, "mic": True})
+        self.assertEqual(viewer.call(f"/teams/{tid}/stage/react", {"emoji": "🔥"})[0], 400)
+        self.assertEqual(viewer.call(f"/teams/{tid}/stage/start", {})[0], 403)
+        owner.ok(f"/teams/{tid}/stage/start", {})
+        self.assertEqual(owner.call(f"/teams/{tid}/stage/start", {})[0], 409)
+        self.assertTrue(any("demoing live now" in n["text"] for n in viewer.ok("/notifications")["notifications"]))
+        self.assertFalse(any("demoing live now" in n["text"] for n in mate.ok("/notifications")["notifications"]))
+        live = [d for d in viewer.ok("/demos")["demos"] if d["team_id"] == tid]
+        self.assertEqual((live[0]["status"], live[0]["stage"]), ("live", 1))
+
+        hb = viewer.ok(f"/teams/{tid}/stage/heartbeat", {"session": v1})
+        self.assertTrue(hb["live"])
+        self.assertEqual([(p["session"], p["screen"]) for p in hb["participants"]], [(p1, True)])  # viewers only see presenters
+        other.ok(f"/teams/{tid}/stage/heartbeat", {"session": v2})
+        mate.ok(f"/teams/{tid}/stage/heartbeat", {"session": p2})
+        seen = owner.ok(f"/teams/{tid}/stage/heartbeat", {"session": p1, "screen": True})
+        self.assertEqual({p["session"] for p in seen["participants"]}, {p1, p2, v1, v2})  # presenters see everyone
+        self.assertEqual(seen["viewers"], 2)
+        # Signaling: presenter↔viewer and presenter↔presenter, never viewer↔viewer.
+        owner.ok(f"/teams/{tid}/stage/signal", {"session": p1, "to": v1, "kind": "offer", "payload": {"sdp": "x"}})
+        owner.ok(f"/teams/{tid}/stage/signal", {"session": p1, "to": p2, "kind": "offer", "payload": {"sdp": "y"}})
+        self.assertEqual(viewer.call(f"/teams/{tid}/stage/signal", {"session": v1, "to": v2, "kind": "offer", "payload": {}})[0], 403)
+        self.assertEqual(viewer.call(f"/teams/{tid}/stage/signal", {"session": p1, "to": v2, "kind": "offer", "payload": {}})[0], 403)
+        got = viewer.ok(f"/teams/{tid}/stage/heartbeat", {"session": v1})["signals"]
+        self.assertEqual([(g["from"], g["payload"]["sdp"]) for g in got], [(p1, "x")])
+
+        viewer.ok(f"/teams/{tid}/stage/react", {"emoji": "🔥"})
+        qid = viewer.ok(f"/teams/{tid}/stage/questions", {"text": "Does it scale?"})["question_id"]
+        self.assertEqual(viewer.call(f"/teams/{tid}/stage/questions/{qid}/answered", {})[0], 403)
+        self.assertTrue(mate.ok(f"/teams/{tid}/stage/questions/{qid}/answered", {})["answered"])
+        st = viewer.ok(f"/teams/{tid}/stage")
+        self.assertEqual((st["live"], st["presenter"], st["reactions"], st["questions"][0]["answered"]), (True, False, {"🔥": 1}, True))
+        self.assertTrue(owner.ok(f"/teams/{tid}/stage")["presenter"])
+        self.assertEqual(owner.call(f"/teams/{tid}/reopen", {})[0], 409)  # end the demo first
+
+        summary = mate.ok(f"/teams/{tid}/stage/end", {})
+        self.assertEqual((summary["peak"], summary["reactions"], summary["questions"]), (2, 1, 1))
+        st = viewer.ok(f"/teams/{tid}/stage")
+        self.assertEqual((st["live"], st["demo"]["status"]), (False, "past"))
+        self.assertFalse(viewer.ok(f"/teams/{tid}/stage/heartbeat", {"session": v1})["live"])
+        self.assertIn("ended the demo", owner.ok(f"/teams/{tid}/room")["log"][0]["text"])
+
+    def test_demo_stage_viewer_cap(self):
+        owner, mate, tid = self.shipped_team("cap17")
+        owner.ok(f"/teams/{tid}/finish", {"title": "Packed", "repo_url": "https://github.com/x/y"})
+        owner.ok(f"/teams/{tid}/stage/start", {})
+        cap = server.STAGE_MAX_VIEWERS
+        server.STAGE_MAX_VIEWERS = 1
+        try:
+            a, b = self.signup("capa17"), self.signup("capb17")
+            self.assertFalse(a.ok(f"/teams/{tid}/stage/heartbeat", {"session": "cap-viewer-a"}).get("full"))
+            self.assertTrue(b.ok(f"/teams/{tid}/stage/heartbeat", {"session": "cap-viewer-b"})["full"])
+            self.assertFalse(a.ok(f"/teams/{tid}/stage/heartbeat", {"session": "cap-viewer-a"}).get("full"))  # already in
+        finally:
+            server.STAGE_MAX_VIEWERS = cap
+
     def test_cannot_join_past_challenge(self):
         c = self.signup("late4")
         past = c.ok("/challenges?status=past")["challenges"][0]

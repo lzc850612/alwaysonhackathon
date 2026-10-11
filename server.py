@@ -130,6 +130,13 @@ CREATE TABLE IF NOT EXISTS idea_fans(
 CREATE TABLE IF NOT EXISTS lineup(
   occ_id TEXT NOT NULL, team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE, position INTEGER NOT NULL,
   zoom_url TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(occ_id, team_id), UNIQUE(occ_id, position));
+CREATE TABLE IF NOT EXISTS stage_presence(
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE, session TEXT NOT NULL,
+  user_id INTEGER NOT NULL REFERENCES users(id), role TEXT NOT NULL, screen INTEGER DEFAULT 0, cam INTEGER DEFAULT 0,
+  mic INTEGER DEFAULT 0, last_seen INTEGER NOT NULL, PRIMARY KEY(team_id, session));
+CREATE TABLE IF NOT EXISTS stage_questions(
+  id INTEGER PRIMARY KEY, demo_id INTEGER NOT NULL REFERENCES demos(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id), text TEXT NOT NULL, answered INTEGER DEFAULT 0, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS ritual_notices(occ_id TEXT NOT NULL, phase TEXT NOT NULL, PRIMARY KEY(occ_id, phase));
 CREATE INDEX IF NOT EXISTS idx_transcripts_team ON transcripts(team_id, id);
 CREATE INDEX IF NOT EXISTS idx_signals_to ON signals(team_id, to_session, id);
@@ -173,6 +180,11 @@ MIGRATIONS = [
     "ALTER TABLE members ADD COLUMN doing_at INTEGER",
     "ALTER TABLE room_presence ADD COLUMN caption TEXT DEFAULT ''",
     "ALTER TABLE posts ADD COLUMN ritual TEXT",
+    "ALTER TABLE teams ADD COLUMN status TEXT DEFAULT 'building'",
+    "ALTER TABLE teams ADD COLUMN shipped_at INTEGER",
+    "ALTER TABLE demos ADD COLUMN stage INTEGER DEFAULT 0",
+    "ALTER TABLE demos ADD COLUMN ended_at INTEGER",
+    "ALTER TABLE demos ADD COLUMN peak INTEGER DEFAULT 0",
 ]
 
 
@@ -336,9 +348,11 @@ def team_out(db, r, t=None):
     members = team_members(db, r["id"])
     return {"id": r["id"], "challenge_id": r["challenge_id"], "challenge_title": r["challenge_title"],
             "challenge_status": status_of(r["c_starts"], r["c_ends"], t or now()),
+            "challenge_starts_at": r["c_starts"], "challenge_ends_at": r["c_ends"],
             "name": r["name"], "idea": r["idea"], "looking_for": jl(r["looking_for"]),
             "max_size": r["max_size"], "owner_id": r["owner_id"], "members": members,
-            "open": len(members) < r["max_size"]}
+            "status": r["status"] or "building", "shipped_at": r["shipped_at"],
+            "open": len(members) < r["max_size"] and r["status"] != "shipped"}
 
 
 def get_team(db, tid):
@@ -699,6 +713,8 @@ def update_team(c, tid):
 def check_can_join(db, team_row, uid):
     if db.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()[0] != "hacker":
         raise ApiError(403, "Only hacker accounts can join teams")
+    if team_row["status"] == "shipped":
+        raise ApiError(409, "This team has shipped its project — the roster is closed")
     if team_row["c_ends"] <= now():
         raise ApiError(400, "That challenge has ended")
     if team_for_user_in_challenge(db, uid, team_row["challenge_id"]):
@@ -892,23 +908,28 @@ def suggest_people(c, tid):
 def submit(c):
     u, b = c.me(), c.body
     r = get_team(c.db, int_field(b, "team_id", 0, 1, 10 ** 9))
-    if u["id"] not in [m["id"] for m in team_members(c.db, r["id"])]:
+    sid = save_submission(c.db, r, u, b)
+    return 201, {"submission": dict(c.db.execute("SELECT * FROM submissions WHERE id=?", (sid,)).fetchone())}
+
+
+def save_submission(db, r, u, b):
+    if u["id"] not in [m["id"] for m in team_members(db, r["id"])]:
         raise ApiError(403, "Only team members can submit")
     if status_of(r["c_starts"], r["c_ends"], now()) != "live":
         raise ApiError(400, "Submissions are only open while the challenge is live")
     fields = (text(b, "title", True, 80), text(b, "description", max_len=1200), url_field(b, "repo_url"), url_field(b, "demo_url"))
     if not (fields[2] or fields[3]):
         raise ApiError(400, "Add a repo or demo link")
-    existing = c.db.execute("SELECT id FROM submissions WHERE team_id=?", (r["id"],)).fetchone()
+    existing = db.execute("SELECT id FROM submissions WHERE team_id=?", (r["id"],)).fetchone()
     if existing:
-        c.db.execute("UPDATE submissions SET title=?,description=?,repo_url=?,demo_url=? WHERE id=?", fields + (existing["id"],))
+        db.execute("UPDATE submissions SET title=?,description=?,repo_url=?,demo_url=? WHERE id=?", fields + (existing["id"],))
         sid = existing["id"]
     else:
-        sid = c.db.execute("INSERT INTO submissions(team_id,challenge_id,title,description,repo_url,demo_url,created_at)"
+        sid = db.execute("INSERT INTO submissions(team_id,challenge_id,title,description,repo_url,demo_url,created_at)"
                            " VALUES(?,?,?,?,?,?,?)", (r["id"], r["challenge_id"]) + fields + (now(),)).lastrowid
-        notify(c.db, [j["id"] for j in c.db.execute("SELECT id FROM users WHERE role='judge'")],
+        notify(db, [j["id"] for j in db.execute("SELECT id FROM users WHERE role='judge'")],
                f"New project to judge: {fields[0]} ({r['challenge_title']})", "#/judge")
-    return 201, {"submission": dict(c.db.execute("SELECT * FROM submissions WHERE id=?", (sid,)).fetchone())}
+    return sid
 
 
 @route("POST", r"/api/submissions/(\d+)/vote")
@@ -1003,7 +1024,7 @@ def analytics(c):
 # --- demos (Zoom) & notifications ---
 
 def demo_status(d, t):
-    end = d["starts_at"] + d["duration_min"] * 60
+    end = d["ended_at"] or d["starts_at"] + d["duration_min"] * 60
     return "upcoming" if t < d["starts_at"] else "live" if t < end else "past"
 
 
@@ -1910,6 +1931,257 @@ def ritual_notice_loop(db_path, srv):
         finally:
             db.close()
         time.sleep(30)
+
+
+# --- finishing a project, and its live Demo Stage ---
+
+@route("POST", r"/api/teams/(\d+)/finish")
+def finish_team(c, tid):
+    """Close the roster, lock in the submission, and move the team to its demo stage. Any member can do it."""
+    u = c.me()
+    r = get_team(c.db, int(tid))
+    if not is_member(c.db, r["id"], u["id"]):
+        raise ApiError(403, "Only team members can finish the project")
+    if r["status"] == "shipped":
+        raise ApiError(409, "Already shipped")
+    if c.body.get("title"):
+        save_submission(c.db, r, u, c.body)
+    elif not c.db.execute("SELECT 1 FROM submissions WHERE team_id=?", (r["id"],)).fetchone():
+        raise ApiError(400, "Add your submission (title + repo or demo link) to finish")
+    t = now()
+    c.db.execute("UPDATE teams SET status='shipped', shipped_at=? WHERE id=?", (t, r["id"]))
+    pending = c.db.execute("SELECT * FROM requests WHERE team_id=? AND status='pending'", (r["id"],)).fetchall()
+    c.db.execute("UPDATE requests SET status='withdrawn' WHERE team_id=? AND status='pending'", (r["id"],))
+    notify(c.db, [p["user_id"] for p in pending], f"{r['name']} shipped their project and closed the roster — find another team?", "#/teams")
+    members = [m["id"] for m in team_members(c.db, r["id"])]
+    notify(c.db, [m for m in members if m != u["id"]], f"🏁 @{u['handle']} finished {r['name']} — your demo stage is ready", f"#/t/{r['id']}/stage")
+    log_team(c.db, r["id"], u["id"], "finished the project 🏁 — roster closed, on to the demo")
+    return 200, {"ok": True, "withdrawn": len(pending)}
+
+
+@route("POST", r"/api/teams/(\d+)/reopen")
+def reopen_team(c, tid):
+    u = c.me()
+    r = get_team(c.db, int(tid))
+    if not is_member(c.db, r["id"], u["id"]):
+        raise ApiError(403, "Only team members can reopen the project")
+    if r["status"] != "shipped":
+        raise ApiError(409, "The team is still building")
+    if r["c_ends"] <= now():
+        raise ApiError(400, "The challenge is over — no reopening now")
+    if stage_demo(c.db, r["id"]):
+        raise ApiError(409, "End the live demo first")
+    c.db.execute("UPDATE teams SET status='building', shipped_at=NULL WHERE id=?", (r["id"],))
+    log_team(c.db, r["id"], u["id"], "reopened the project to keep building")
+    return 200, {"ok": True}
+
+
+STAGE_WINDOW = 10   # seconds; stage clients heartbeat every ~1.5s
+STAGE_MAX_VIEWERS = 30  # each viewer is a direct connection from every presenter; beyond this, use an SFU
+
+
+def stage_demo(db, team_id, include_ended=False):
+    """The team's live stage demo, or with include_ended its most recent one."""
+    where = "" if include_ended else " AND ended_at IS NULL AND starts_at + duration_min*60 > ?"
+    args = (team_id,) if include_ended else (team_id, now())
+    return db.execute("SELECT * FROM demos WHERE team_id=? AND stage=1" + where + " ORDER BY starts_at DESC LIMIT 1",
+                      args).fetchone()
+
+
+def stage_people(db, team_id):
+    return db.execute("SELECT * FROM stage_presence WHERE team_id=? AND last_seen>? ORDER BY role DESC, session",
+                      (team_id, now() - STAGE_WINDOW)).fetchall()
+
+
+def is_member(db, team_id, uid):
+    return uid is not None and db.execute("SELECT 1 FROM members WHERE team_id=? AND user_id=?", (team_id, uid)).fetchone() is not None
+
+
+@route("GET", r"/api/teams/(\d+)/stage")
+def stage(c, tid):
+    r = get_team(c.db, int(tid))
+    uid = c.user["id"] if c.user else None
+    live = stage_demo(c.db, r["id"])
+    shown = live or stage_demo(c.db, r["id"], include_ended=True)
+    sub = c.db.execute("SELECT * FROM submissions WHERE team_id=?", (r["id"],)).fetchone()
+    people = stage_people(c.db, r["id"])
+    out = {"team": team_out(c.db, r), "submission": dict(sub) if sub else None, "presenter": is_member(c.db, r["id"], uid),
+           "live": bool(live), "demo": None, "viewers": sum(1 for p in people if p["role"] == "viewer"),
+           "presenters": [{"user": user_out(c.db.execute("SELECT * FROM users WHERE id=?", (p["user_id"],)).fetchone()),
+                           "screen": bool(p["screen"]), "cam": bool(p["cam"]), "mic": bool(p["mic"])}
+                          for p in people if p["role"] == "presenter"],
+           "questions": [], "reactions": {}, "emojis": EMOJIS}
+    if shown:
+        d = dict(shown)
+        d["status"] = demo_status(shown, now())
+        out["demo"] = d
+        out["reactions"] = reaction_counts(c.db, f"stage-{shown['id']}").get(-1, {})
+        out["questions"] = [dict(q, user=user_out(q)) for q in c.db.execute(
+            "SELECT q.id AS qid, q.text AS qtext, q.answered, q.created_at AS asked_at, u.* FROM stage_questions q"
+            " JOIN users u ON u.id=q.user_id WHERE q.demo_id=? ORDER BY q.answered, q.created_at", (shown["id"],))]
+        out["questions"] = [{"id": q["qid"], "text": q["qtext"], "answered": bool(q["answered"]), "created_at": q["asked_at"],
+                             "user": q["user"]} for q in out["questions"]]
+    return 200, out
+
+
+@route("POST", r"/api/teams/(\d+)/stage/start")
+def stage_start(c, tid):
+    u = c.me()
+    r = get_team(c.db, int(tid))
+    if not is_member(c.db, r["id"], u["id"]):
+        raise ApiError(403, "Only the team can go live")
+    if r["status"] != "shipped":
+        raise ApiError(400, "Finish the project first — then the stage is yours")
+    if stage_demo(c.db, r["id"]):
+        raise ApiError(409, "You're already live")
+    sub = c.db.execute("SELECT title FROM submissions WHERE team_id=?", (r["id"],)).fetchone()
+    title = text(c.body, "title", max_len=80) or (sub["title"] if sub else f"{r['name']} demo")
+    t = now()
+    did = c.db.execute("INSERT INTO demos(team_id,title,zoom_url,starts_at,duration_min,created_by,created_at,stage)"
+                       " VALUES(?,?,?,?,?,?,?,1)", (r["id"], title, "", t, 60, u["id"], t)).lastrowid
+    members = {m["id"] for m in team_members(c.db, r["id"])}
+    notify(c.db, [x["id"] for x in c.db.execute("SELECT id FROM users") if x["id"] not in members],
+           f"🎬 {r['name']} is demoing live now: {title}", f"#/t/{r['id']}/stage")
+    log_team(c.db, r["id"], u["id"], "went live on the demo stage 🎬")
+    return 201, {"demo_id": did}
+
+
+@route("POST", r"/api/teams/(\d+)/stage/end")
+def stage_end(c, tid):
+    u = c.me()
+    r = get_team(c.db, int(tid))
+    if not is_member(c.db, r["id"], u["id"]):
+        raise ApiError(403, "Only the team can end the demo")
+    d = stage_demo(c.db, r["id"])
+    if not d:
+        raise ApiError(409, "Not live")
+    t = now()
+    c.db.execute("UPDATE demos SET ended_at=? WHERE id=?", (t, d["id"]))
+    reacts = sum(reaction_counts(c.db, f"stage-{d['id']}").get(-1, {}).values())
+    questions = c.db.execute("SELECT COUNT(*) FROM stage_questions WHERE demo_id=?", (d["id"],)).fetchone()[0]
+    log_team(c.db, r["id"], u["id"], f"ended the demo — {d['peak']} watching at peak, {reacts} reactions, {questions} questions")
+    return 200, {"minutes": max(1, (t - d["starts_at"]) // 60), "peak": d["peak"], "reactions": reacts, "questions": questions}
+
+
+@route("POST", r"/api/teams/(\d+)/stage/heartbeat")
+def stage_heartbeat(c, tid):
+    """Presence + signaling for the stage. Presenters (team members) see every viewer so they can call them;
+    viewers only see presenters. Viewers are admitted while the team is live, up to STAGE_MAX_VIEWERS."""
+    u = c.me()
+    r = get_team(c.db, int(tid))
+    b, t = c.body, now()
+    session = session_field(b, "session")
+    presenter = is_member(c.db, r["id"], u["id"])
+    live = stage_demo(c.db, r["id"])
+    known = c.db.execute("SELECT 1 FROM stage_presence WHERE team_id=? AND session=? AND last_seen>?",
+                         (r["id"], session, t - STAGE_WINDOW)).fetchone()
+    if not presenter:
+        if not live:
+            c.db.execute("DELETE FROM stage_presence WHERE team_id=? AND session=?", (r["id"], session))
+            return 200, {"live": False, "participants": [], "signals": [], "viewers": 0}
+        viewers = c.db.execute("SELECT COUNT(*) FROM stage_presence WHERE team_id=? AND role='viewer' AND last_seen>?",
+                               (r["id"], t - STAGE_WINDOW)).fetchone()[0]
+        if not known and viewers >= STAGE_MAX_VIEWERS:
+            return 200, {"live": True, "full": True, "participants": [], "signals": [], "viewers": viewers}
+    c.db.execute("INSERT INTO stage_presence(team_id,session,user_id,role,screen,cam,mic,last_seen) VALUES(?,?,?,?,?,?,?,?)"
+                 " ON CONFLICT(team_id,session) DO UPDATE SET screen=excluded.screen, cam=excluded.cam, mic=excluded.mic,"
+                 " last_seen=excluded.last_seen",
+                 (r["id"], session, u["id"], "presenter" if presenter else "viewer",
+                  1 if presenter and b.get("screen") else 0, 1 if presenter and b.get("cam") else 0,
+                  1 if presenter and b.get("mic") else 0, t))
+    c.db.execute("DELETE FROM stage_presence WHERE last_seen<?", (t - 5 * STAGE_WINDOW,))
+    people = stage_people(c.db, r["id"])
+    viewers = sum(1 for p in people if p["role"] == "viewer")
+    if live and viewers > live["peak"]:
+        c.db.execute("UPDATE demos SET peak=? WHERE id=?", (viewers, live["id"]))
+    since = int_field(b, "since", 0, 0, 10 ** 12)
+    signals = [{"id": x["id"], "from": x["from_session"], "kind": x["kind"], "payload": json.loads(x["payload"])}
+               for x in c.db.execute("SELECT * FROM signals WHERE team_id=? AND to_session=? AND id>? ORDER BY id",
+                                     (r["id"], session, since))]
+    visible = [p for p in people if presenter or p["role"] == "presenter"]
+    return 200, {"live": bool(live), "viewers": viewers, "signals": signals,
+                 "participants": [{"session": p["session"], "user_id": p["user_id"], "role": p["role"],
+                                   "screen": bool(p["screen"]), "cam": bool(p["cam"]), "mic": bool(p["mic"])} for p in visible]}
+
+
+@route("POST", r"/api/teams/(\d+)/stage/signal")
+def stage_signal(c, tid):
+    u = c.me()
+    r = get_team(c.db, int(tid))
+    b = c.body
+    frm, to = session_field(b, "session"), session_field(b, "to")
+    me_row = c.db.execute("SELECT role FROM stage_presence WHERE team_id=? AND session=? AND user_id=?", (r["id"], frm, u["id"])).fetchone()
+    them = c.db.execute("SELECT role FROM stage_presence WHERE team_id=? AND session=?", (r["id"], to)).fetchone()
+    if not me_row:
+        raise ApiError(403, "Join the stage first")
+    if not them:
+        raise ApiError(404, "They left")
+    if "presenter" not in (me_row["role"], them["role"]):
+        raise ApiError(403, "Viewers only connect to presenters")
+    if b.get("kind") not in ("offer", "answer", "bye"):
+        raise ApiError(400, "kind must be offer, answer or bye")
+    payload = json.dumps(b.get("payload"))
+    if len(payload) > 20_000:
+        raise ApiError(413, "Signal too large")
+    c.db.execute("INSERT INTO signals(team_id,from_session,to_session,kind,payload,created_at) VALUES(?,?,?,?,?,?)",
+                 (r["id"], frm, to, b["kind"], payload, now()))
+    return 201, {"ok": True}
+
+
+@route("POST", r"/api/teams/(\d+)/stage/leave")
+def stage_leave(c, tid):
+    u = c.me()
+    c.db.execute("DELETE FROM stage_presence WHERE team_id=? AND session=? AND user_id=?",
+                 (int(tid), session_field(c.body, "session"), u["id"]))
+    return 200, {"ok": True}
+
+
+def live_stage_demo(c, tid):
+    d = stage_demo(c.db, int(tid))
+    if not d:
+        raise ApiError(400, "This team isn't live right now")
+    return d
+
+
+@route("POST", r"/api/teams/(\d+)/stage/react")
+def stage_react(c, tid):
+    u = c.me()
+    d = live_stage_demo(c, tid)
+    emoji = c.body.get("emoji")
+    if emoji not in EMOJIS:
+        raise ApiError(400, "Unknown reaction")
+    key, t = (u["id"], f"stage-{d['id']}"), time.time()
+    if t - c.srv.react_times.get(key, 0) < 0.2:
+        raise ApiError(429, "Easy there")
+    c.srv.react_times[key] = t
+    c.db.execute("INSERT INTO reactions(occ_id,slot,emoji,n) VALUES(?,?,?,1) ON CONFLICT(occ_id,slot,emoji) DO UPDATE SET n=n+1",
+                 (f"stage-{d['id']}", -1, emoji))
+    return 200, {"ok": True}
+
+
+@route("POST", r"/api/teams/(\d+)/stage/questions")
+def stage_ask(c, tid):
+    u = c.me()
+    d = live_stage_demo(c, tid)
+    if c.db.execute("SELECT COUNT(*) FROM stage_questions WHERE demo_id=? AND user_id=? AND answered=0",
+                    (d["id"], u["id"])).fetchone()[0] >= 3:
+        raise ApiError(429, "You have 3 open questions — let them answer first")
+    qid = c.db.execute("INSERT INTO stage_questions(demo_id,user_id,text,created_at) VALUES(?,?,?,?)",
+                       (d["id"], u["id"], text(c.body, "text", True, 280), now())).lastrowid
+    return 201, {"question_id": qid}
+
+
+@route("POST", r"/api/teams/(\d+)/stage/questions/(\d+)/answered")
+def stage_answered(c, tid, qid):
+    u = c.me()
+    if not is_member(c.db, int(tid), u["id"]):
+        raise ApiError(403, "Only presenters can mark questions answered")
+    q = c.db.execute("SELECT q.* FROM stage_questions q JOIN demos d ON d.id=q.demo_id WHERE q.id=? AND d.team_id=?",
+                     (int(qid), int(tid))).fetchone()
+    if not q:
+        raise ApiError(404, "Question not found")
+    c.db.execute("UPDATE stage_questions SET answered=1-answered WHERE id=?", (q["id"],))
+    return 200, {"answered": not q["answered"]}
 
 
 # ---------- HTTP ----------

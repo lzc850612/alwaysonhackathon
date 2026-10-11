@@ -107,6 +107,7 @@ function onSubmit(selector, handler) {
 }
 
 function modal(title, bodyHtml, okLabel, onOk) {
+  if (document.querySelector('dialog[open]')) return; // one dialog at a time (e.g. a double click)
   const d = document.createElement('dialog');
   d.innerHTML = `<form class="stack"><h2>${esc(title)}</h2>${bodyHtml}
     <div class="row" style="justify-content:flex-end"><button type="button" class="btn ghost" data-close>Cancel</button>
@@ -192,14 +193,15 @@ function demoCard(d, opts = {}) {
   const when = d.status === 'live' ? '<span class="pill live">Live now</span>'
     : d.status === 'upcoming' ? `<span class="pill upcoming">in <span data-until="${d.starts_at}">${until(d.starts_at)}</span></span>`
     : '<span class="pill past">Ended</span>';
-  const btn = d.status === 'past' ? ''
+  const btn = d.stage ? (d.status === 'live' ? `<a class="btn sm live-btn" href="#/t/${d.team_id}/stage">▶ Watch live</a>` : `<a class="btn sm ghost" href="#/t/${d.team_id}/stage">Recap</a>`)
+    : d.status === 'past' ? ''
     : `<button class="btn sm ${d.status === 'live' ? '' : 'ghost'}" data-act="watch" data-id="${d.id}">${d.status === 'live' ? 'Join on Zoom ↗' : d.watching ? 'Going ✓ — open link' : "I'll watch"}</button>`;
   return `<div class="card demo">
-    <div class="row spread">${when}<span class="small muted">${d.watchers} watching</span></div>
+    <div class="row spread">${when}<span class="small muted">${d.stage ? `🎬 in-app${d.peak ? ` · ${d.peak} watching at peak` : ''}` : `${d.watchers} watching`}</span></div>
     <h3 style="margin:8px 0 2px">${esc(d.title)}</h3>
     <div class="small muted"><a href="#/t/${d.team_id}">${esc(d.team_name)}</a> · <a href="#/c/${d.challenge_id}">${esc(d.challenge_title)}</a></div>
     <div class="small muted">${new Date(d.starts_at * 1000).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' })} · ${d.duration_min} min</div>
-    <div class="row" style="margin-top:10px">${btn}${opts.cancel ? `<button class="btn sm danger" data-act="cancel-demo" data-id="${d.id}">Cancel</button>` : ''}</div>
+    <div class="row" style="margin-top:10px">${btn}${opts.cancel && !d.stage ? `<button class="btn sm danger" data-act="cancel-demo" data-id="${d.id}">Cancel</button>` : ''}</div>
   </div>`;
 }
 
@@ -411,7 +413,8 @@ async function viewTeam(id) {
   const sub = d.submission;
   const canSubmit = isMember && t.challenge_status === 'live';
   let html = `<div class="row small muted"><a href="#/c/${t.challenge_id}">← ${esc(t.challenge_title)}</a>${pill(t.challenge_status)}</div>
-  <div class="row spread" style="margin-top:12px"><h1 style="margin:0">${esc(t.name)}</h1>${action}</div>
+  <div class="row spread" style="margin-top:12px"><div class="row"><h1 style="margin:0">${esc(t.name)}</h1>
+    ${t.status === 'shipped' ? `<span class="pill live">Shipped</span><a class="btn sm ghost" href="#/t/${t.id}/stage">🎬 Demo stage</a>` : ''}</div>${t.status === 'shipped' && !isMember ? '' : action}</div>
   ${t.idea ? `<p class="muted" style="max-width:65ch;margin-top:8px">${esc(t.idea)}</p>` : ''}
   <div class="split section" style="margin-top:20px"><div class="stack">
     <div class="card"><div class="section-head"><h2>Members</h2><span class="small muted">${t.members.length}/${t.max_size}</span></div>
@@ -1016,6 +1019,7 @@ const routes = [
   [/^teams$/, viewTeams],
   [/^t\/(\d+)$/, viewTeam],
   [/^t\/(\d+)\/room$/, viewRoom],
+  [/^t\/(\d+)\/stage$/, viewStage],
   [/^people$/, viewPeople],
   [/^u\/([a-z0-9_-]+)$/, viewPerson],
   [/^inbox$/, viewInbox],
@@ -1064,6 +1068,7 @@ async function render() {
   const seq = ++renderSeq;
   clearInterval(floorTimer);
   leaveRoom();
+  leaveStage();
   stopLive();
   const [path, query] = location.hash.replace(/^#\/?/, '').split('?');
   const params = new URLSearchParams(query || '');

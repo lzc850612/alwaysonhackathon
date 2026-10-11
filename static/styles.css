@@ -363,3 +363,28 @@ a.ritual-hero.live { border: 2px solid var(--live); }
 .lineup-row.now { background: rgba(18, 183, 106, .08); border-radius: 8px; padding: 8px; }
 .award { display: flex !important; flex-direction: column; gap: 2px; border-top: 4px solid #f5b400; }
 @media (max-width: 600px) { .clock-right > a.muted { display: none; } .clock-right { margin-left: 0; } }
+
+/* ---------- finish & demo stage ---------- */
+.shipped-banner { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; border-left: 4px solid var(--live); }
+.shipped-banner > div:first-child { display: flex; flex-direction: column; gap: 2px; }
+.btn.live-btn { background: #e5484d; color: #fff; }
+.btn.on-air { background: var(--live); color: #fff; }
+.stage-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 900px) { .stage-grid { grid-template-columns: 1fr; } }
+.stage-main { position: relative; aspect-ratio: 16 / 9; background: #0d0b18; border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
+.stage-main video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; opacity: 0; }
+.stage-main.has-screen video { opacity: 1; }
+.stage-who { position: absolute; left: 12px; top: 12px; background: rgba(0, 0, 0, .6); color: #fff; font-size: 12px; padding: 3px 10px; border-radius: 99px; }
+.stage-who:empty { display: none; }
+.stage-waiting { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 6px; align-items: center; justify-content: center; color: #cfc9ef; text-align: center; padding: 20px; }
+.stage-cams { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+.stage-cams:empty { display: none; }
+.cam-tile { aspect-ratio: 4 / 3; }
+#stage-controls:empty { display: none; }
+#stage-controls { display: flex; flex-direction: column; gap: 4px; }
+.question { display: flex; gap: 10px; align-items: flex-start; }
+.question .who { flex: 1; min-width: 0; }
+.question.answered { opacity: .55; }
+.question .btn { margin-top: 4px; }
+.finish-wait { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 2px; text-align: right; }
+@media (max-width: 600px) { .finish-wait { align-items: flex-start; text-align: left; } }

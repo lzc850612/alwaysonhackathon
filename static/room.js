@@ -436,6 +436,35 @@ function timelinePanel(d) {
     : '<p class="small muted" style="margin:0">Status changes and new builds show up here.</p>';
 }
 
+function finishAction(t) {
+  if (t.status === 'shipped') return '<span class="pill live">Shipped</span>';
+  // Projects can only be submitted while the challenge is live, so say why the button is greyed out.
+  if (t.challenge_status === 'upcoming') {
+    return `<span class="finish-wait"><button class="btn" type="button" disabled>🏁 Finish &amp; go to demo</button>
+      <span class="small muted">Opens when ${esc(t.challenge_title)} starts — in <span data-until="${t.challenge_starts_at}">${until(t.challenge_starts_at)}</span></span></span>`;
+  }
+  if (t.challenge_status === 'past') {
+    return `<span class="finish-wait"><button class="btn" type="button" disabled>🏁 Finish &amp; go to demo</button>
+      <span class="small muted">${esc(t.challenge_title)} has ended — submissions are closed</span></span>`;
+  }
+  return '<button class="btn" type="button" data-finish="open">🏁 Finish &amp; go to demo</button>';
+}
+
+async function finishProject(t) {
+  const sub = (await api(`/teams/${t.id}`)).submission || {};
+  modal('Finish & go to demo', `<p class="small muted" style="margin:0">This is for the whole team: it locks in your submission, closes the roster (pending requests are withdrawn) and opens your demo stage. Teammates are notified, and anyone on the team can reopen while the challenge is running.</p>
+    <label>Project title<input name="title" required maxlength="80" value="${esc(sub.title || t.name)}"></label>
+    <label>What does it do?<textarea name="description" maxlength="1200" rows="3">${esc(sub.description)}</textarea></label>
+    <div class="form-grid"><label>Repo URL<input name="repo_url" type="url" placeholder="https://github.com/…" value="${esc(sub.repo_url)}"></label>
+    <label>Live demo URL<input name="demo_url" type="url" placeholder="https://…" value="${esc(sub.demo_url || room?.previewUrl || '')}"></label></div>`,
+  '🏁 Ship it', async (v) => {
+    const r = await api(`/teams/${t.id}/finish`, v);
+    await refreshMe();
+    toast(`Shipped 🏁${r.withdrawn ? ` — ${r.withdrawn} pending request${r.withdrawn > 1 ? 's' : ''} withdrawn` : ''}`);
+    location.hash = `#/t/${t.id}/stage`;
+  });
+}
+
 function previewMeta(p) {
   return p.url ? `Pushed by @${esc(p.by)} ${ago(p.at)} · blank? Some sites refuse to be embedded — use ↗` : '';
 }
@@ -444,9 +473,13 @@ async function viewRoom(id) {
   if (!me) { location.hash = '#/join'; return ''; }
   const d = await api(`/teams/${id}/room`);
   const t = d.team;
-  const html = `<div class="row spread"><div><div class="row small muted"><a href="#/t/${t.id}">← ${esc(t.name)}</a>${pill(t.challenge_status)}
+  const html = `<div class="room-page"><div class="row spread"><div><div class="row small muted"><a href="#/t/${t.id}">← ${esc(t.name)}</a>${pill(t.challenge_status)}
       <span>${esc(t.challenge_title)}</span></div><h1 style="margin:6px 0 0">${esc(t.name)} · Team Room</h1></div>
-      <span class="small muted">Private to the ${d.members.length} of you</span></div>
+      <div class="row"><span class="small muted">Private to the ${d.members.length} of you</span>${finishAction(t)}</div></div>
+    ${t.status === 'shipped' ? `<div class="card shipped-banner section"><div><b>🏁 Shipped!</b> The roster is closed and your demo stage is ready.
+      <span class="small muted">Share your screen, go live, and everyone can watch and ask questions.</span></div>
+      <div class="row"><a class="btn live-btn" href="#/t/${t.id}/stage">🎬 Go to demo stage</a>
+      ${t.challenge_status === 'live' ? '<button class="btn ghost sm" type="button" data-finish="reopen">Reopen</button>' : ''}</div></div>` : ''}
     <div class="room-grid section" style="margin-top:18px">
       <section class="card browser">
         <form class="urlbar" id="preview-form"><span class="lights"><i></i><i></i><i></i></span>
@@ -470,7 +503,7 @@ async function viewRoom(id) {
     <div class="grid two section">
       <div class="card"><h3>What everyone's doing</h3><div id="doing">${doingPanel(d)}</div></div>
       <div class="card"><h3>Team timeline</h3><div id="timeline">${timelinePanel(d)}</div></div>
-    </div>`;
+    </div></div>`;
 
   return [html, () => {
     const r = room = {
@@ -552,6 +585,15 @@ async function viewRoom(id) {
         refresh();
       } catch (err) { toast(err.message, true); }
     };
+
+    // Bound to this render's own wrapper (not #app, which outlives renders) so clicks never stack up handlers.
+    document.querySelector('.room-page').addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-finish]');
+      if (!b) return;
+      if (b.dataset.finish === 'open') { finishProject(t).catch((err) => toast(err.message, true)); return; }
+      if (!confirm('Reopen the project? The roster opens again and the stage closes until you finish.')) return;
+      try { await api(`/teams/${t.id}/reopen`, {}); toast('Reopened — keep building'); render(); } catch (err) { toast(err.message, true); }
+    });
 
     // Call controls: delegated, with press-and-hold for push-to-talk.
     const controls = document.getElementById('call-controls');

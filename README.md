@@ -39,6 +39,12 @@ Demo accounts (sign-in is by handle only in this MVP): `ben` (has an invite), `l
 - **Call:** camera is opt-in and off by default. **Hold to talk** (button or Space bar) un-mutes your mic only while held, and talkers are highlighted. Audio and video go directly between teammates' browsers (WebRTC); the server only passes the connection setup between them (`/room/heartbeat`, `/room/signal`), and nothing is recorded. Camera and mic need HTTPS, or `localhost`.
 - **Transcript:** while you hold to talk, your browser's built-in speech recognition turns your words into text. Teammates see live captions on your tile, and finished phrases are saved to the team transcript (Download .txt / Clear). It's per person (📝 *Transcribe me*, default on, remembered), and words still unfinished when you let go are kept. Chrome sends the audio to Google's servers to convert it; Firefox has no speech recognition, so the switch shows as unavailable there.
 
+**Finish → Demo Stage**: the end of the build-to-demo flow.
+- **🏁 Finish & go to demo** (Team Room, any team member): confirms the submission (pre-filled), marks the team **Shipped**, and closes the roster. The team drops out of "Find a team" and matching, pending requests and invites are withdrawn (those people are told), and teammates are notified. Any member can **Reopen** while the challenge runs.
+- **Demo Stage** (`#/t/<id>/stage`) runs the demo inside the app, no Zoom needed. Presenters (team members) set up privately first (🖥 **share screen**, 📷 camera as a small inset, 🎙 microphone that stays on while presenting), then **🔴 Go live**. Everyone is notified, and the demo appears on Demos with "▶ Watch live".
+- **Viewers** see the shared screen and presenters' cameras, hear the presenters, react with emoji, and ask questions that presenters mark answered. **End demo** shows everyone a recap (peak viewers, reactions, questions).
+- **How the video works:** every presenter sends directly to every viewer, and presenters see and hear each other. Each connection carries audio, screen and camera from the start, so toggling any of them never interrupts the stream. Viewers are capped at 30 (`STAGE_MAX_VIEWERS`); a bigger audience needs a media server (e.g. LiveKit). Screen sharing needs a desktop browser over HTTPS, or `localhost`.
+
 **The shared clock** (`#/live`). Always-on shouldn't mean always empty, so three rituals a week put everyone in the same moment. The schedule is fixed in code (`RITUALS` in `server.py`), so there's nothing to administer:
 
 | Ritual | When (UTC) | What happens |
@@ -75,4 +81,5 @@ test_server.py   end-to-end API tests
 - **Judges:** assign judges per challenge, and decide winners when a challenge closes.
 - **Calls:** add a TURN server. Without one, some teammates on strict corporate or carrier networks can't connect directly. The many-to-many design suits teams of 4 or fewer; larger groups would need a media server such as LiveKit.
 - **Transcripts:** for consistent quality across browsers, record clips on talk and transcribe them on the server (e.g. Whisper). Also add a retention policy, since transcripts are kept until a member clears them.
+- **Demo Stage at scale:** switch to a media server so one upload reaches any number of viewers, and add recording for replays.
 - **Database:** SQLite is fine for a pilot; move to Postgres when you outgrow it.
