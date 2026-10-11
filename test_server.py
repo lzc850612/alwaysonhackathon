@@ -45,7 +45,8 @@ class ApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
-        cls.db = os.path.join(cls.tmp, "test.db")
+        # AOH_TEST_DATABASE_URL=postgres://… runs the whole suite against Postgres (use an empty, throwaway database).
+        cls.db = os.environ.get("AOH_TEST_DATABASE_URL") or os.path.join(cls.tmp, "test.db")
         cls.srv = make_server(cls.db, port=0, quiet=True)
         seed.seed(cls.db)
         seed.seed_builders(cls.db)
@@ -318,19 +319,20 @@ class ApiTest(unittest.TestCase):
         owner, joiner, latecomer = self.signup("autoowner10"), self.signup("autojoiner10"), self.signup("autolate10")
         ch = self.live_challenge(owner)
         tid = owner.ok("/teams", {"challenge_id": ch["id"], "name": "Autobots", "max_size": 2})["team"]["id"]
-        self.srv.auto_approve = 0.2
+        self.srv.auto_approve = 60
         try:
             r = joiner.ok(f"/teams/{tid}/join", {"message": "hi"})
-            self.assertEqual(r["auto_approve_in"], 0.2)
+            self.assertEqual(r["auto_approve_in"], 60)
             # The latecomer's request comes in before the first approval fills the team (max 2).
             latecomer.ok(f"/teams/{tid}/join", {})
+            self.srv.auto_approve = 0.2  # approvals happen lazily, on the next request after the delay
             deadline = time.time() + 5
             while time.time() < deadline and len(owner.ok(f"/teams/{tid}")["team"]["members"]) < 2:
                 time.sleep(0.05)
             time.sleep(0.4)
         finally:
             self.srv.auto_approve = 0
-        # Both timers fire together, so either may win — but never both (max_size 2).
+        # Only one of the two pending requests can get the last spot (max_size 2).
         members = {m["handle"] for m in owner.ok(f"/teams/{tid}")["team"]["members"]} - {"autoowner10"}
         self.assertEqual(len(members), 1)
         winner, loser = (joiner, latecomer) if members == {"autojoiner10"} else (latecomer, joiner)
@@ -582,6 +584,7 @@ class ApiTest(unittest.TestCase):
     # ---------- build lab ----------
 
     def wait_run(self, client, tid, rid):
+        client.ok(f"/teams/{tid}/agent/{rid}/run", {})  # the agent works inside this request
         deadline = time.time() + 5
         while time.time() < deadline:
             run = next(x for x in client.ok(f"/teams/{tid}/build")["runs"] if x["id"] == rid)
@@ -654,7 +657,9 @@ class ApiTest(unittest.TestCase):
             self.assertEqual((run["status"], run["mode"], run["summary"]), ("ready", "claude", "Made the button bigger."))
             self.assertEqual(seen["context"]["team"], "cl19 team")
             self.assertEqual(set(seen["files"]), {"index.html", "styles.css", "app.js"})
-            self.assertEqual(owner.call(f"/teams/{tid}/agent", {"prompt": "again"})[0], 201)
+            st, again = owner.call(f"/teams/{tid}/agent", {"prompt": "again"})
+            self.assertEqual(st, 201)
+            self.wait_run(owner, tid, again["run"]["id"])
 
             def boom(*a):
                 raise server.AgentError("Claude declined this task. Try rephrasing what you'd like built.")
@@ -860,6 +865,70 @@ class ApiTest(unittest.TestCase):
         db = connect(self.db)
         self.assertEqual(db.execute("SELECT COUNT(*) FROM challenges WHERE sponsor_id IS NULL").fetchone()[0], n)
         db.close()
+
+
+class PostgresDialectTest(unittest.TestCase):
+    """The SQLite → Postgres rewrites in db.py (the Postgres path itself runs against a real database in production)."""
+
+    def test_translate(self):
+        from db import translate, translate_schema
+        self.assertEqual(translate("SELECT * FROM users WHERE id=? AND handle LIKE 'a%'"),
+                         ("SELECT * FROM users WHERE id=%s AND handle LIKE 'a%%'", False))
+        self.assertEqual(translate("SELECT 'x%'", has_params=False), ("SELECT 'x%'", False))
+        self.assertEqual(translate("INSERT INTO teams(name) VALUES(?)"), ("INSERT INTO teams(name) VALUES(%s) RETURNING id", True))
+        self.assertEqual(translate("INSERT OR IGNORE INTO votes(submission_id,user_id) VALUES(?,?)"),
+                         ("INSERT INTO votes(submission_id,user_id) VALUES(%s,%s) ON CONFLICT DO NOTHING", False))
+        sql, rid = translate("INSERT OR REPLACE INTO scores(submission_id,judge_id,innovation) VALUES(?,?,?)")
+        self.assertTrue(sql.endswith("ON CONFLICT (submission_id, judge_id) DO UPDATE SET innovation=EXCLUDED.innovation"))
+        self.assertFalse(rid)
+        self.assertIn("pg_advisory_xact_lock", translate("BEGIN IMMEDIATE")[0])
+        ddl = translate_schema("PRAGMA x; CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER); ALTER TABLE t ADD COLUMN m INTEGER")
+        self.assertEqual(ddl, ["CREATE TABLE t(id BIGSERIAL PRIMARY KEY, n BIGINT)",
+                               "ALTER TABLE t ADD COLUMN IF NOT EXISTS m BIGINT"])
+
+    def test_every_insert_with_an_id_is_covered(self):
+        """Every table with an integer id must be in ID_TABLES, or .lastrowid would be None on Postgres."""
+        import re
+        from db import ID_TABLES
+        tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)\(\s*id INTEGER PRIMARY KEY", server.SCHEMA))
+        self.assertEqual(tables - ID_TABLES, set())
+
+
+class WsgiTest(unittest.TestCase):
+    """The Vercel entrypoint: the same handler core behind a WSGI callable."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        path = os.path.join(self.tmp, "wsgi.db")
+        server.init_db(path)
+        self.saved = server._app_cfg
+        server._app_cfg = server.configure(server.AppConfig(), path, quiet=True)
+        server._app_cfg.live_ritual = None
+
+    def tearDown(self):
+        server._app_cfg = self.saved
+        shutil.rmtree(self.tmp)
+
+    def call(self, method, path, body=None, cookie="", query=""):
+        import io
+        data = json.dumps(body).encode() if body is not None else b""
+        env = {"REQUEST_METHOD": method, "PATH_INFO": path, "QUERY_STRING": query, "wsgi.input": io.BytesIO(data),
+               "CONTENT_TYPE": "application/json" if body is not None else "", "CONTENT_LENGTH": str(len(data)),
+               "HTTP_COOKIE": cookie, "HTTP_X_FORWARDED_PROTO": "https"}
+        out = {}
+        chunks = server.app(env, lambda status, headers: out.update(status=status, headers=dict(headers)))
+        return out["status"], out["headers"], b"".join(chunks)
+
+    def test_signup_session_and_static(self):
+        status, headers, body = self.call("POST", "/api/signup", {"handle": "wsgi1", "name": "W", "password": "pw-123456"})
+        self.assertTrue(status.startswith("201"), body)
+        cookie = headers["Set-Cookie"]
+        self.assertIn("Secure", cookie)  # behind https
+        status, _, body = self.call("GET", "/api/me", cookie=cookie.split(";")[0])
+        self.assertEqual(json.loads(body)["user"]["handle"], "wsgi1")
+        status, headers, body = self.call("GET", "/")
+        self.assertTrue(status.startswith("200") and b"<html" in body.lower())
+        self.assertEqual(self.call("GET", "/api/nope")[0], "404 Not Found")
 
 
 if __name__ == "__main__":

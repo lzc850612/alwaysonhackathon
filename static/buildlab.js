@@ -211,6 +211,7 @@ function mountBuildLab(el, team) {
       const prevRuns = JSON.stringify(lab.state?.runs);
       const finished = lab.state && lab.state.runs.some((r) => r.status === 'running') && !next.runs.some((r) => r.status === 'running');
       lab.state = next;
+      next.runs.filter((r) => r.status === 'running' && !r.started_at).forEach((r) => startRun(r.id));
       if (prevVersion && prevVersion !== next.version && lab.dirty) toast(`A teammate saved v${next.version} — your unsaved edits are kept`);
       if (!lab.dirty) lab.drafts = {};
       paintMeta();
@@ -230,14 +231,26 @@ function mountBuildLab(el, team) {
     }
   }
 
+  // The agent works inside its own long request (so it also runs on serverless hosts). Whoever started the task
+  // kicks it off; if they left before it began, the next teammate whose lab sees it picks it up.
+  function startRun(id) {
+    lab.kicked = lab.kicked || new Set();
+    if (lab.kicked.has(id)) return;
+    lab.kicked.add(id);
+    api(`/teams/${team.id}/agent/${id}/run`, {})
+      .then(() => { if (lab.alive) { clearTimeout(lab.timer); refresh(false); } })
+      .catch((e) => console.warn('agent run failed', e));
+  }
+
   async function sendPrompt(text) {
     const prompt = text.trim();
     if (!prompt) return;
     try {
-      await api(`/teams/${team.id}/agent`, { prompt });
+      const { run } = await api(`/teams/${team.id}/agent`, { prompt });
       document.getElementById('lab-input').value = '';
       lab.pendingFocus = true;
       clearTimeout(lab.timer);
+      startRun(run.id);
       await refresh(true);
     } catch (e) { toast(e.message, true); }
   }

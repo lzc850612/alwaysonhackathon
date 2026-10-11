@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Always-On Hackathon — a zero-dependency server (Python 3.8+ stdlib only).
+"""Always-On Hackathon — one stdlib-only server (Python 3.9+); Postgres needs psycopg, the live agent needs anthropic.
 
-Run:  python3 server.py [--port 8000] [--db data/aoh.db] [--no-seed]
+Run:  python3 server.py [--port 8000] [--db data/aoh.db | --db postgres://…] [--no-seed]
+Deploy: Vercel picks up the WSGI `app` below; set DATABASE_URL to a Postgres database (see README).
 """
 import argparse
 import json
@@ -190,11 +191,7 @@ class ApiError(Exception):
         self.message = message
 
 
-def connect(path):
-    db = sqlite3.connect(path, timeout=10)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
-    return db
+from db import connect, is_postgres  # noqa: E402  (SQLite locally, Postgres when given a postgres:// URL)
 
 
 # Columns added after the first release; ALTER is a no-op error on databases that already have them.
@@ -229,6 +226,7 @@ MIGRATIONS = [
     "ALTER TABLE challenges ADD COLUMN venue TEXT DEFAULT ''",
     "ALTER TABLE challenges ADD COLUMN info TEXT DEFAULT ''",
     "ALTER TABLE challenges ADD COLUMN food TEXT DEFAULT '[]'",
+    "ALTER TABLE agent_runs ADD COLUMN started_at INTEGER",
     "ALTER TABLE challenges ADD COLUMN video_url TEXT DEFAULT ''",
     "ALTER TABLE challenges ADD COLUMN is_real INTEGER DEFAULT 0",
     "ALTER TABLE challenges ADD COLUMN verified_at TEXT DEFAULT ''",
@@ -243,10 +241,18 @@ SEEKING = ("Teammates", "Co-founders")
 
 
 def init_db(path):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if not is_postgres(path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     db = connect(path)
     db.executescript(SCHEMA)
     for sql in MIGRATIONS:
+        if is_postgres(path):
+            # Skip columns that exist: even ADD COLUMN IF NOT EXISTS takes a table lock that waits on live requests.
+            table, col = re.match(r"ALTER TABLE (\w+) ADD COLUMN (\w+)", sql).groups()
+            if not db.execute("SELECT 1 FROM information_schema.columns WHERE table_name=? AND column_name=?",
+                              (table, col)).fetchone():
+                db.run_ddl(sql)
+            continue
         try:
             db.execute(sql)
         except sqlite3.OperationalError:
@@ -276,7 +282,7 @@ def ensure_open_sprint(db, t=None):
     new_id = db.execute("SELECT id FROM challenges WHERE sponsor_id IS NULL AND starts_at=?", (starts_at,)).fetchone()[0]
     prev = db.execute("SELECT id FROM challenges WHERE sponsor_id IS NULL AND starts_at<? ORDER BY starts_at DESC LIMIT 1",
                       (starts_at,)).fetchone()
-    if prev and db.execute("SELECT name FROM sqlite_master WHERE name='hackathon_sponsors'").fetchone():
+    if prev:
         db.execute("INSERT OR IGNORE INTO hackathon_sponsors(challenge_id,sponsor_id,tier,offer,details,link,sort)"
                    " SELECT ?,sponsor_id,tier,offer,details,link,sort FROM hackathon_sponsors WHERE challenge_id=?", (new_id, prev[0]))
 
@@ -880,18 +886,22 @@ def accept_request(db, rq, team, auto=False):
         notify(db, [team["owner_id"]], f"@{handle} accepted your invite to {team['name']}", f"#/t/{team['id']}")
 
 
-def auto_approve(db_path, rid):
-    """Demo mode: approve a join request on the owner's behalf, if it's still valid."""
-    db = connect(db_path)
-    try:
-        rq = db.execute("SELECT * FROM requests WHERE id=? AND kind='join' AND status='pending'", (rid,)).fetchone()
-        if rq:
-            accept_request(db, rq, get_team(db, rq["team_id"]), auto=True)
+def process_auto_approvals(db, delay, t=None):
+    """Demo mode: approve join requests on the owner's behalf once they're `delay` seconds old.
+
+    Runs at the start of any request rather than on a timer, so it works on serverless hosts too —
+    clients poll, so a request lands within a second or two of the deadline anyway."""
+    t = t or time.time()
+    ids = [r[0] for r in db.execute("SELECT id FROM requests WHERE kind='join' AND status='pending'"
+                                    " AND created_at<=? AND created_at>? ORDER BY id", (t - delay, t - 600))]
+    for rid in ids:
+        try:
+            rq = db.execute("SELECT * FROM requests WHERE id=? AND status='pending'", (rid,)).fetchone()
+            if rq:
+                accept_request(db, rq, get_team(db, rq["team_id"]), auto=True)
             db.commit()
-    except ApiError:
-        db.rollback()  # e.g. the team filled up meanwhile; the request stays pending for the owner
-    finally:
-        db.close()
+        except ApiError:
+            db.rollback()  # e.g. the team filled up meanwhile; the request stays pending for the owner
 
 
 @route("POST", r"/api/teams/(\d+)/join")
@@ -905,7 +915,6 @@ def request_join(c, tid):
                        (r["id"], u["id"], "join", text(c.body, "message", max_len=400), now())).lastrowid
     delay = c.srv.auto_approve
     if delay:
-        c.after_commit.append(lambda: threading.Timer(delay, auto_approve, (c.srv.db_path, rid)).start())
         return 201, {"request_id": rid, "auto_approve_in": delay}
     notify(c.db, [r["owner_id"]], f"@{u['handle']} asked to join {r['name']}", f"#/t/{r['id']}")
     return 201, {"request_id": rid}
@@ -1735,6 +1744,10 @@ def require_live(o):
 def clock(c):
     """The shared clock: server time (clients sync to it), live/next rituals, and your team's deadline."""
     t = now()
+    # Ritual "starting soon / live" notices go out from here (every client polls the clock), at most every 20s per process.
+    if t - getattr(c.srv, "notices_at", 0) >= 20:
+        c.srv.notices_at = t
+        run_ritual_notices(c.db, c.srv.demo_ritual, t)
     region = region_of(c.user["tz"]) if c.user else None
     week = [dict(o, live=is_live(o, t)) for o in occurrences(t - 2 * 3600, t + 7 * DAY, c.srv.demo_ritual)
             if relevant(o, region)]
@@ -2074,19 +2087,6 @@ def run_ritual_notices(db, demo=None, t=None):
     return sent
 
 
-def ritual_notice_loop(db_path, srv):
-    while True:
-        db = connect(db_path)
-        try:
-            run_ritual_notices(db, srv.demo_ritual)
-            db.commit()
-        except Exception:
-            traceback.print_exc()
-        finally:
-            db.close()
-        time.sleep(30)
-
-
 # --- finishing a project, and its live Demo Stage ---
 
 @route("POST", r"/api/teams/(\d+)/finish")
@@ -2348,6 +2348,7 @@ def stage_answered(c, tid, qid):
 BUILD_FILES = ("index.html", "styles.css", "app.js")
 BUILD_MAX_FILE = 60_000
 AGENT_MODEL = "claude-opus-5-5"
+AGENT_TIMEOUT = 600  # seconds before an unfinished run is given up on
 AGENT_HOURLY_LIMIT = 20
 AGENT_SYSTEM = """You are the build agent inside a hackathon team's workspace. The team is building a small static web \
 prototype made of exactly three files: index.html, styles.css and app.js. index.html links them with \
@@ -2469,7 +2470,7 @@ def run_out(db, r):
     who = db.execute("SELECT handle, name FROM users WHERE id=?", (r["user_id"],)).fetchone()
     return {"id": r["id"], "prompt": r["prompt"], "status": r["status"], "mode": r["mode"], "summary": r["summary"],
             "files": json.loads(r["files"]) if r["files"] else None, "error": r["error"], "base_version": r["base_version"],
-            "created_at": r["created_at"], "finished_at": r["finished_at"],
+            "created_at": r["created_at"], "started_at": r["started_at"], "finished_at": r["finished_at"],
             "user": {"id": r["user_id"], "handle": who["handle"], "name": who["name"]} if who else None}
 
 
@@ -2477,12 +2478,15 @@ def run_out(db, r):
 def build_state(c, tid):
     u, r = require_member(c, tid)
     head = ensure_build(c.db, r)
+    # A run whose worker died (closed tab, function timeout) would block the team forever; give up on it.
+    c.db.execute("UPDATE agent_runs SET status='failed', error=?, finished_at=? WHERE team_id=? AND status='running'"
+                 " AND created_at<?", ("The agent timed out. Try again.", now(), r["id"], now() - AGENT_TIMEOUT))
     names = {x["id"]: x["handle"] for x in c.db.execute("SELECT id, handle FROM users")}
     versions = [{"id": v["id"], "note": v["note"], "by": names.get(v["user_id"]), "created_at": v["created_at"]}
                 for v in c.db.execute("SELECT id, note, user_id, created_at FROM build_versions WHERE team_id=?"
                                       " ORDER BY id DESC LIMIT 15", (r["id"],))]
     runs = [run_out(c.db, x) for x in c.db.execute(
-        "SELECT * FROM (SELECT * FROM agent_runs WHERE team_id=? ORDER BY id DESC LIMIT 20) ORDER BY id", (r["id"],))]
+        "SELECT * FROM (SELECT * FROM agent_runs WHERE team_id=? ORDER BY id DESC LIMIT 20) AS recent ORDER BY id", (r["id"],))]
     mode = agent_mode() if c.srv.agent_mode is None else c.srv.agent_mode
     return 200, {"files": json.loads(head["files"]), "version": head["id"], "versions": versions, "runs": runs,
                  "agent": {"mode": mode, "model": AGENT_MODEL if mode == "claude" else None},
@@ -2523,22 +2527,39 @@ def agent_start(c, tid):
     mode = agent_mode() if c.srv.agent_mode is None else c.srv.agent_mode
     rid = c.db.execute("INSERT INTO agent_runs(team_id,user_id,prompt,status,mode,base_version,created_at)"
                        " VALUES(?,?,?,?,?,?,?)", (r["id"], u["id"], prompt, "running", mode, head["id"], now())).lastrowid
-    context = {"team": r["name"], "idea": r["idea"], "challenge": r["challenge_title"],
-               "looking_for": jl(r["looking_for"])}
-    sub = c.db.execute("SELECT title, description FROM submissions WHERE team_id=?", (r["id"],)).fetchone()
-    if sub:
-        context["submission"] = {"title": sub["title"], "description": sub["description"]}
-    history = [{"prompt": x["prompt"], "summary": x["summary"], "status": x["status"]} for x in c.db.execute(
-        "SELECT prompt, summary, status FROM agent_runs WHERE team_id=? AND id<? AND status IN ('applied','discarded')"
-        " ORDER BY id DESC LIMIT 4", (r["id"], rid))][::-1]
-    job = (c.srv.db_path, rid, mode, prompt, json.loads(head["files"]), context, history, c.srv.agent_delay)
-    c.after_commit.append(lambda: threading.Thread(target=run_agent, args=job, daemon=True).start())
     log_team(c.db, r["id"], u["id"], f"asked the build agent: {prompt[:80]}")
     return 201, {"run": run_out(c.db, c.db.execute("SELECT * FROM agent_runs WHERE id=?", (rid,)).fetchone())}
 
 
+@route("POST", r"/api/teams/(\d+)/agent/(\d+)/run")
+def agent_run(c, tid, rid):
+    """Do the work for a run the team started. The starting client calls this right after creating the run
+    (any teammate's lab picks up a run nobody started), and the request lasts as long as the agent does —
+    so it works on serverless hosts, where nothing may run after a response is sent."""
+    u, r = require_member(c, tid)
+    run = c.db.execute("SELECT * FROM agent_runs WHERE id=? AND team_id=?", (int(rid), r["id"])).fetchone()
+    if not run:
+        raise ApiError(404, "No such agent task")
+    claimed = c.db.execute("UPDATE agent_runs SET started_at=? WHERE id=? AND status='running' AND started_at IS NULL",
+                           (now(), run["id"])).rowcount
+    if claimed:
+        context = {"team": r["name"], "idea": r["idea"], "challenge": r["challenge_title"],
+                   "looking_for": jl(r["looking_for"])}
+        sub = c.db.execute("SELECT title, description FROM submissions WHERE team_id=?", (r["id"],)).fetchone()
+        if sub:
+            context["submission"] = {"title": sub["title"], "description": sub["description"]}
+        history = [{"prompt": x["prompt"], "summary": x["summary"], "status": x["status"]} for x in c.db.execute(
+            "SELECT prompt, summary, status FROM agent_runs WHERE team_id=? AND id<? AND status IN ('applied','discarded')"
+            " ORDER BY id DESC LIMIT 4", (r["id"], run["id"]))][::-1]
+        base = c.db.execute("SELECT files FROM build_versions WHERE id=?", (run["base_version"],)).fetchone()
+        files = json.loads(base["files"]) if base else json.loads(ensure_build(c.db, r)["files"])
+        c.db.commit()  # release the claim before the long wait
+        run_agent(c.srv.db_path, run["id"], run["mode"], run["prompt"], files, context, history, c.srv.agent_delay)
+    return 200, {"run": run_out(c.db, c.db.execute("SELECT * FROM agent_runs WHERE id=?", (run["id"],)).fetchone())}
+
+
 def run_agent(db_path, rid, mode, prompt, files, context, history, delay):
-    """Background worker: produce a proposal, then record it (or the failure) on the run."""
+    """Produce a proposal, then record it (or the failure) on the run."""
     status, summary, proposal, error = "ready", "", None, ""
     try:
         if mode == "claude":
@@ -2869,6 +2890,91 @@ def set_onboarding(c, tid):
 
 # ---------- HTTP ----------
 
+def json_response(status, payload, cookie=None, secure=False):
+    headers = [("Content-Type", "application/json"), ("Cache-Control", "no-store")]
+    if cookie is not None:
+        age = 30 * DAY if cookie else 0
+        headers.append(("Set-Cookie", f"{COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age={age}"
+                                      + ("; Secure" if secure else "")))
+    return status, headers, json.dumps(payload).encode()
+
+
+def static_response(path):
+    rel = path.lstrip("/")
+    target = os.path.realpath(os.path.join(STATIC, rel[len("static/"):] if rel.startswith("static/") else "index.html"))
+    if not target.startswith(STATIC + os.sep) or not os.path.isfile(target):
+        target = os.path.join(STATIC, "index.html")
+    with open(target, "rb") as f:
+        data = f.read()
+    ctype = (mimetypes.guess_type(target)[0] or "application/octet-stream") + "; charset=utf-8"
+    return 200, [("Content-Type", ctype), ("Cache-Control", "no-cache")], data
+
+
+def read_body(method, headers, read):
+    if method != "POST":
+        return {}
+    # Requiring a JSON content type blocks cross-site form posts (CSRF) without a token.
+    if "application/json" not in (headers.get("Content-Type") or ""):
+        raise ApiError(415, "Send application/json")
+    length = int(headers.get("Content-Length") or 0)
+    if length > 256_000:  # room for three project files at 60 KB each
+        raise ApiError(413, "Request too large")
+    try:
+        body = json.loads(read(length) or b"{}")
+    except ValueError:
+        raise ApiError(400, "Invalid JSON")
+    if not isinstance(body, dict):
+        raise ApiError(400, "Expected a JSON object")
+    return body
+
+
+def current_user(db, headers):
+    jar = SimpleCookie(headers.get("Cookie") or "")
+    if COOKIE not in jar:
+        return None
+    return db.execute("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?",
+                      (jar[COOKIE].value,)).fetchone()
+
+
+def handle(cfg, method, path, query, headers, read):
+    """One request, independent of the server around it: returns (status, [(header, value)], body bytes).
+    `cfg` carries the server settings (db_path, auto_approve, …); `headers` needs .get(); `read(n)` reads the body."""
+    if not path.startswith("/api/"):
+        if method != "GET":
+            return json_response(405, {"error": "Method not allowed"})
+        return static_response(path)
+    secure = (headers.get("X-Forwarded-Proto") or "").lower() == "https"
+    db = connect(cfg.db_path)
+    try:
+        if cfg.auto_approve:
+            process_auto_approvals(db, cfg.auto_approve)
+        ctx = Ctx(db, current_user(db, headers), read_body(method, headers, read), parse_qs(query), cfg)
+        for m, rx, fn in ROUTES:
+            match = rx.match(path)
+            if m == method and match:
+                status, payload = fn(ctx, *match.groups())
+                db.commit()
+                for task in ctx.after_commit:
+                    task()
+                if isinstance(payload, Raw):
+                    data = payload.data.encode() if isinstance(payload.data, str) else payload.data
+                    hdrs = [("Content-Type", payload.content_type)]
+                    if payload.filename:
+                        hdrs.append(("Content-Disposition", f'attachment; filename="{payload.filename}"'))
+                    return status, hdrs, data
+                return json_response(status, payload, ctx.set_cookie, secure)
+        raise ApiError(404, "Not found")
+    except ApiError as e:
+        db.rollback()
+        return json_response(e.status, {"error": e.message})
+    except Exception:
+        db.rollback()
+        traceback.print_exc()
+        return json_response(500, {"error": "Something broke on our side"})
+    finally:
+        db.close()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AlwaysOnHackathon/0.1"
 
@@ -2882,113 +2988,93 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.dispatch("POST")
 
-    def send_json(self, status, payload, cookie=None):
-        data = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        if cookie is not None:
-            age = 30 * DAY if cookie else 0
-            self.send_header("Set-Cookie", f"{COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age={age}")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def send_raw(self, status, raw):
-        data = raw.data.encode() if isinstance(raw.data, str) else raw.data
-        self.send_response(status)
-        self.send_header("Content-Type", raw.content_type)
-        self.send_header("Content-Length", str(len(data)))
-        if raw.filename:
-            self.send_header("Content-Disposition", f'attachment; filename="{raw.filename}"')
-        self.end_headers()
-        self.wfile.write(data)
-
-    def serve_static(self, path):
-        rel = path.lstrip("/")
-        target = os.path.realpath(os.path.join(STATIC, rel[len("static/"):] if rel.startswith("static/") else "index.html"))
-        if not target.startswith(STATIC + os.sep) or not os.path.isfile(target):
-            target = os.path.join(STATIC, "index.html")
-        with open(target, "rb") as f:
-            data = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", (mimetypes.guess_type(target)[0] or "application/octet-stream") + "; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def current_user(self, db):
-        jar = SimpleCookie(self.headers.get("Cookie") or "")
-        if COOKIE not in jar:
-            return None
-        return db.execute("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?",
-                          (jar[COOKIE].value,)).fetchone()
-
-    def read_body(self, method):
-        if method != "POST":
-            return {}
-        # Requiring a JSON content type blocks cross-site form posts (CSRF) without a token.
-        if "application/json" not in (self.headers.get("Content-Type") or ""):
-            raise ApiError(415, "Send application/json")
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > 256_000:  # room for three project files at 60 KB each
-            raise ApiError(413, "Request too large")
-        try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except ValueError:
-            raise ApiError(400, "Invalid JSON")
-        if not isinstance(body, dict):
-            raise ApiError(400, "Expected a JSON object")
-        return body
-
     def dispatch(self, method):
         parsed = urlparse(self.path)
-        if not parsed.path.startswith("/api/"):
-            if method != "GET":
-                return self.send_json(405, {"error": "Method not allowed"})
-            return self.serve_static(parsed.path)
-        db = connect(self.server.db_path)
-        try:
-            ctx = Ctx(db, self.current_user(db), self.read_body(method), parse_qs(parsed.query), self.server)
-            for m, rx, fn in ROUTES:
-                match = rx.match(parsed.path)
-                if m == method and match:
-                    status, payload = fn(ctx, *match.groups())
-                    db.commit()
-                    for task in ctx.after_commit:
-                        task()
-                    if isinstance(payload, Raw):
-                        return self.send_raw(status, payload)
-                    return self.send_json(status, payload, ctx.set_cookie)
-            raise ApiError(404, "Not found")
-        except ApiError as e:
-            db.rollback()
-            self.send_json(e.status, {"error": e.message})
-        except Exception:
-            db.rollback()
-            traceback.print_exc()
-            self.send_json(500, {"error": "Something broke on our side"})
-        finally:
-            db.close()
+        status, headers, data = handle(self.server, method, parsed.path, parsed.query, self.headers, self.rfile.read)
+        self.send_response(status)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
 
-def make_server(db_path, host="127.0.0.1", port=8000, quiet=False, auto_approve=0, live_ritual=None, ritual_notices=False):
-    init_db(db_path)
-    srv = ThreadingHTTPServer((host, port), Handler)
-    srv.db_path, srv.quiet = db_path, quiet
-    srv.auto_approve = auto_approve  # seconds before join requests approve themselves; 0 = owners decide
-    srv.react_times = {}
-    srv.agent_mode = None   # None = detect (Claude when the SDK + credentials exist); tests pin "simulated"
-    srv.agent_delay = 1.5   # simulated agent's pause, so its working state is visible
-    srv.demo_ritual = None
+def configure(cfg, db_path, quiet=False, auto_approve=0, live_ritual=None):
+    cfg.db_path, cfg.quiet = db_path, quiet
+    cfg.auto_approve = auto_approve  # seconds before join requests approve themselves; 0 = owners decide
+    cfg.react_times = {}
+    cfg.agent_mode = None   # None = detect (Claude when the SDK + credentials exist); tests pin "simulated"
+    cfg.agent_delay = 1.5   # simulated agent's pause, so its working state is visible
+    cfg.demo_ritual = None
     if live_ritual:
         # Demo mode: run one ritual right now. The ceremony starts just before its demos so the stage goes live in a minute.
         lead = CLOSING_INTRO - 60 if live_ritual == "closing" else 60
-        srv.demo_ritual = {"key": live_ritual, "starts_at": now() - lead}
-    if ritual_notices:
-        threading.Thread(target=ritual_notice_loop, args=(db_path, srv), daemon=True).start()
-    return srv
+        cfg.demo_ritual = {"key": live_ritual, "starts_at": now() - lead}
+    return cfg
+
+
+def make_server(db_path, host="127.0.0.1", port=8000, quiet=False, auto_approve=0, live_ritual=None):
+    init_db(db_path)
+    srv = ThreadingHTTPServer((host, port), Handler)
+    return configure(srv, db_path, quiet, auto_approve, live_ritual)
+
+
+# ---------- WSGI entrypoint (Vercel and other serverless / WSGI hosts) ----------
+
+class AppConfig:
+    pass
+
+
+_app_cfg = None
+_app_lock = threading.Lock()
+
+
+def app_config():
+    """Built on the first request: Postgres from DATABASE_URL (Neon on Vercel), else a throwaway SQLite file."""
+    global _app_cfg
+    with _app_lock:
+        if _app_cfg is None:
+            target = (os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+                      or os.path.join(os.environ.get("TMPDIR", "/tmp"), "aoh.db"))
+            init_db(target)
+            if os.environ.get("AOH_SEED", "1") != "0":
+                import seed
+                seed.seed_all(target)
+            _app_cfg = configure(AppConfig(), target, quiet=True,
+                                 auto_approve=max(0.0, float(os.environ.get("AOH_AUTO_APPROVE", 2))))
+            _app_cfg.live_ritual = os.environ.get("AOH_LIVE_RITUAL") or None
+        cfg = _app_cfg
+    if cfg.live_ritual in RITUALS:
+        # Every function instance must agree on when the demo ritual started: pin it to the top of the hour.
+        lead = CLOSING_INTRO - 60 if cfg.live_ritual == "closing" else 60
+        cfg.demo_ritual = {"key": cfg.live_ritual, "starts_at": now() // 3600 * 3600 - lead}
+    return cfg
+
+
+class _EnvironHeaders:
+    def __init__(self, environ):
+        self.environ = environ
+
+    def get(self, name, default=None):
+        key = name.upper().replace("-", "_")
+        if key in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+            return self.environ.get(key) or default
+        return self.environ.get("HTTP_" + key, default)
+
+
+STATUS_TEXT = {200: "OK", 201: "Created", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
+               404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 410: "Gone", 413: "Payload Too Large",
+               415: "Unsupported Media Type", 429: "Too Many Requests", 500: "Internal Server Error"}
+
+
+def app(environ, start_response):
+    cfg = app_config()
+    stream = environ.get("wsgi.input")
+    status, headers, data = handle(cfg, environ.get("REQUEST_METHOD", "GET"), environ.get("PATH_INFO") or "/",
+                                   environ.get("QUERY_STRING", ""), _EnvironHeaders(environ),
+                                   lambda n: stream.read(n) if stream and n else b"")
+    start_response(f"{status} {STATUS_TEXT.get(status, 'OK')}", headers + [("Content-Length", str(len(data)))])
+    return [data]
 
 
 def main():
@@ -3002,19 +3088,11 @@ def main():
     ap.add_argument("--live-ritual", choices=sorted(RITUALS), default=os.environ.get("AOH_LIVE_RITUAL") or None,
                     help="demo mode: start this ritual right now instead of waiting for its scheduled time")
     args = ap.parse_args()
-    fresh = not os.path.exists(args.db)
     srv = make_server(args.db, args.host, args.port, auto_approve=max(0.0, args.auto_approve),
-                      live_ritual=args.live_ritual, ritual_notices=True)
-    if fresh and not args.no_seed:
-        import seed
-        seed.seed(args.db)
-        print("Seeded demo data.")
+                      live_ritual=args.live_ritual)
     if not args.no_seed:
         import seed
-        if seed.seed_builders(args.db):
-            print("Added the builders-directory demo data.")
-        if seed.seed_hackathons(args.db):
-            print("Added hackathon pages: AI Engineer NY (Luma), partner sponsors, info and food.")
+        print("Seeded demo data." if seed.seed_all(args.db) else "Demo data is up to date.")
     if srv.demo_ritual and not args.no_seed:
         import seed
         o = make_occ(srv.demo_ritual["key"], srv.demo_ritual["starts_at"])

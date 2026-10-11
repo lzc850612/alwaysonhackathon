@@ -4,6 +4,7 @@ import random
 import re
 from datetime import datetime, timezone
 
+from db import is_postgres
 from server import DAY, connect, ensure_open_sprint, now
 
 SPONSORS = [
@@ -173,18 +174,6 @@ def seed(db_path):
     ensure_open_sprint(db)
     db.commit()
     db.close()
-
-
-if __name__ == "__main__":
-    import os
-    import sys
-    from server import ROOT, init_db
-    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "data", "aoh.db")
-    if os.path.exists(path):
-        sys.exit(f"{path} already exists — delete it first to reseed.")
-    init_db(path)
-    seed(path)
-    print(f"Seeded {path}")
 
 
 def seed_live_ritual(db_path, occ):
@@ -474,3 +463,38 @@ def seed_hackathons(db_path):
     db.commit()
     db.close()
     return True
+
+
+def seed_all(target):
+    """Load all demo data that isn't there yet. Safe to call from several processes at once (serverless cold starts):
+    on Postgres they take turns behind an advisory lock, and each step checks its own marker."""
+    lock = connect(target)
+    try:
+        if is_postgres(target):
+            lock.execute("SELECT pg_advisory_lock(424243)")
+        fresh = not lock.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+        lock.commit()
+        if fresh:
+            seed(target)
+        seed_builders(target)
+        seed_hackathons(target)
+        return fresh
+    finally:
+        if is_postgres(target):
+            lock.execute("SELECT pg_advisory_unlock(424243)")
+            lock.commit()
+        lock.close()
+
+
+if __name__ == "__main__":
+    # One-off: python3 seed.py "$DATABASE_URL"   (or a SQLite path)
+    import os
+    import sys
+
+    from server import init_db
+
+    from server import ROOT
+
+    target = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("DATABASE_URL") or os.path.join(ROOT, "data", "aoh.db")
+    init_db(target)
+    print("Seeded a fresh database." if seed_all(target) else "Topped up demo data (the database already had users).")

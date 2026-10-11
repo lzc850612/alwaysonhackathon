@@ -9,7 +9,7 @@ python3 server.py            # http://127.0.0.1:8000 (demo data is loaded on fir
 python3 -m unittest -v       # API tests
 ```
 
-No dependencies: Python 3.8+ standard library, SQLite and a plain-JS single-page frontend. The optional `anthropic` SDK turns on the real Build lab agent. The UI uses a light theme: a pale canvas, blue→violet gradients, soft white cards and a neural-ribbon hero. To reset the demo data, delete `data/` and restart.
+No dependencies locally: Python 3.9+ standard library, SQLite and a plain-JS single-page frontend. The optional `anthropic` SDK turns on the real Build lab agent. The UI uses a light theme: a pale canvas, blue→violet gradients, soft white cards and a neural-ribbon hero. To reset the demo data, delete `data/` and restart.
 
 **Demo mode is on by default:** a request to join a team approves itself after **2 seconds**, as if the owner had clicked Accept, and drops you into the Team Room. The usual checks still apply: if the team filled up in the meantime, the request waits for the owner. Turn it off for real use:
 
@@ -92,10 +92,40 @@ python3 server.py --live-ritual closing   # or kickoff, checkin
 
 **Matching** (`fit()` in `server.py`) scores 0–100: open roles filled (50%), new skills brought (20%), interest overlap with the challenge tags (15%) and timezone overlap (15%). Each score comes with readable reasons such as "Fills open role: react".
 
+## Deploy to Vercel
+
+The same code runs as a Vercel Python function: `server.py` exposes a WSGI `app`, and Vercel routes every request to it (pages, static files and the API).
+
+1. **Import the repo** at vercel.com/new. No framework preset or build command is needed; `requirements.txt` installs the Postgres driver.
+2. **Add a database:** Storage → Neon Postgres (or any Postgres). This sets `DATABASE_URL`; the pooled connection string is the best choice. Tables are created and demo data is loaded on the first request. To load the data ahead of time, run `python3 seed.py "$DATABASE_URL"`.
+3. **Optional settings:**
+   - `ANTHROPIC_API_KEY` turns on the live Claude agent in the Build lab.
+   - `AOH_AUTO_APPROVE=0` turns off demo auto-approve.
+   - `AOH_LIVE_RITUAL=closing` (or another ritual) runs that ritual at the top of every hour, for demos.
+   - `AOH_JUDGE_CODE` sets the judge sign-up code.
+   - `AOH_SEED=0` skips the demo data.
+4. **Push to `main`** and Vercel redeploys.
+
+Without `DATABASE_URL`, each function instance uses its own throwaway SQLite file in `/tmp`. That's fine for a quick look, but data won't persist or be shared between instances.
+
+**What changed to run serverless.** Nothing may run after a response is sent, so the long-running server's background work is now driven by requests:
+- **Join auto-approve:** handled on the next request after the delay.
+- **Ritual notices:** sent from `/api/clock`, which every open tab polls.
+- **The Build lab agent:** works inside its own `POST …/agent/<id>/run` request, which the lab sends right after starting a task. Runs nobody picked up are given up after 10 minutes.
+
+To test against Postgres locally:
+
+```bash
+AOH_TEST_DATABASE_URL=postgres://… python3 -m unittest test_server
+```
+
+Use an empty, throwaway database for this.
+
 ## Layout
 
 ```
-server.py        HTTP server, SQLite schema, every API route
+server.py        HTTP server + WSGI app (Vercel), schema, every API route
+db.py            SQLite locally / Postgres in production: translates the few dialect differences
 static/buildlab.js  Team Room build lab: agent thread, preview sandbox, diff review, versions
 seed.py          fictional demo data (dates relative to now)
 static/          index.html, app.js (hash-routed SPA), styles.css (light + dark)
@@ -112,4 +142,4 @@ test_server.py   end-to-end API tests
 - **Calls:** add a TURN server. Without one, some teammates on strict corporate or carrier networks can't connect directly. The many-to-many design suits teams of 4 or fewer; larger groups would need a media server such as LiveKit.
 - **Transcripts:** for consistent quality across browsers, record clips on talk and transcribe them on the server (e.g. Whisper). Also add a retention policy, since transcripts are kept until a member clears them.
 - **Demo Stage at scale:** switch to a media server so one upload reaches any number of viewers, and add recording for replays.
-- **Database:** SQLite is fine for a pilot; move to Postgres when you outgrow it.
+- **Database:** SQLite locally; Postgres (`DATABASE_URL`) in production.

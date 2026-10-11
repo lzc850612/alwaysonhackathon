@@ -1,0 +1,4 @@
+# Production (Vercel): Postgres driver. Running locally needs nothing beyond the Python standard library.
+psycopg[binary]>=3.2
+# Optional: the live Claude build agent (also set ANTHROPIC_API_KEY). Without it the Build lab uses the simulated agent.
+anthropic
