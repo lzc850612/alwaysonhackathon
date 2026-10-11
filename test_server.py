@@ -48,6 +48,8 @@ class ApiTest(unittest.TestCase):
         cls.db = os.path.join(cls.tmp, "test.db")
         cls.srv = make_server(cls.db, port=0, quiet=True)
         seed.seed(cls.db)
+        seed.seed_builders(cls.db)
+        seed.seed_hackathons(cls.db)
         cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
 
@@ -576,6 +578,274 @@ class ApiTest(unittest.TestCase):
             self.assertFalse(a.ok(f"/teams/{tid}/stage/heartbeat", {"session": "cap-viewer-a"}).get("full"))  # already in
         finally:
             server.STAGE_MAX_VIEWERS = cap
+
+    # ---------- build lab ----------
+
+    def wait_run(self, client, tid, rid):
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            run = next(x for x in client.ok(f"/teams/{tid}/build")["runs"] if x["id"] == rid)
+            if run["status"] != "running":
+                return run
+            time.sleep(0.05)
+        self.fail("agent run never finished")
+
+    def test_build_lab_simulated_agent(self):
+        owner, mate, tid = self.shipped_team("lab18")
+        outsider = self.signup("labout18")
+        self.srv.agent_mode, self.srv.agent_delay = "simulated", 0
+        try:
+            self.assertEqual(outsider.call(f"/teams/{tid}/build")[0], 403)
+            b = owner.ok(f"/teams/{tid}/build")
+            self.assertEqual(set(b["files"]), {"index.html", "styles.css", "app.js"})
+            self.assertIn("lab18 team", b["files"]["index.html"])  # starter uses the team's name
+            self.assertEqual((b["agent"]["mode"], b["versions"][0]["note"]), ("simulated", "Starter files"))
+
+            rid = mate.ok(f"/teams/{tid}/agent", {"prompt": "Add a progress dashboard"})["run"]["id"]
+            run = self.wait_run(owner, tid, rid)
+            self.assertEqual(run["status"], "ready")
+            self.assertIn("Simulated agent", run["summary"])
+            self.assertIn("tasks", run["files"]["app.js"])
+            # Nothing changes until a teammate applies it.
+            self.assertEqual(owner.ok(f"/teams/{tid}/build")["files"], b["files"])
+            v = owner.ok(f"/teams/{tid}/agent/{rid}/apply", {})["version"]
+            after = mate.ok(f"/teams/{tid}/build")
+            self.assertEqual((after["version"], after["files"]["app.js"]), (v, run["files"]["app.js"]))
+            self.assertEqual(owner.call(f"/teams/{tid}/agent/{rid}/apply", {})[0], 409)  # already handled
+
+            # A proposal made against old files can't silently overwrite newer hand edits.
+            rid2 = owner.ok(f"/teams/{tid}/agent", {"prompt": "Improve keyboard accessibility"})["run"]["id"]
+            self.wait_run(owner, tid, rid2)
+            mate.ok(f"/teams/{tid}/build/files", {"files": {"app.js": "console.log('hand edit')"}, "note": "tweak"})
+            self.assertEqual(owner.call(f"/teams/{tid}/agent/{rid2}/apply", {})[0], 409)
+            owner.ok(f"/teams/{tid}/agent/{rid2}/apply", {"force": True})
+            files = owner.ok(f"/teams/{tid}/build")["files"]
+            self.assertIn("Skip to content", files["index.html"])
+            self.assertEqual(files["app.js"], "console.log('hand edit')")  # untouched files keep the hand edit
+
+            self.assertEqual(mate.call(f"/teams/{tid}/build/files", {"files": {"evil.php": "x"}})[0], 400)
+            self.assertEqual(mate.call(f"/teams/{tid}/build/files", {"files": {"app.js": "x" * 70000}})[0], 400)
+            restored = owner.ok(f"/teams/{tid}/build/restore", {"version_id": b["version"]})["version"]
+            self.assertEqual(owner.ok(f"/teams/{tid}/build")["files"], b["files"])
+            self.assertGreater(restored, v)
+            rid3 = owner.ok(f"/teams/{tid}/agent", {"prompt": "landing page"})["run"]["id"]
+            self.wait_run(owner, tid, rid3)
+            mate.ok(f"/teams/{tid}/agent/{rid3}/discard", {})
+            self.assertEqual(owner.ok(f"/teams/{tid}/build")["files"], b["files"])
+            self.assertIn("asked the build agent", " ".join(x["text"] for x in owner.ok(f"/teams/{tid}/room")["log"]))
+        finally:
+            self.srv.agent_mode, self.srv.agent_delay = None, 1.5
+
+    def test_build_lab_claude_path(self):
+        owner, mate, tid = self.shipped_team("cl19")
+        seen = {}
+        real = server.call_claude
+
+        def fake(prompt, files, context, history):
+            seen.update(prompt=prompt, context=context, files=files)
+            return "Made the button bigger.", {"styles.css": "button { font-size: 20px; }"}
+
+        self.srv.agent_mode = "claude"
+        server.call_claude = fake
+        try:
+            self.assertEqual(owner.ok(f"/teams/{tid}/build")["agent"]["model"], "claude-opus-5-5")
+            rid = owner.ok(f"/teams/{tid}/agent", {"prompt": "Bigger button"})["run"]["id"]
+            run = self.wait_run(owner, tid, rid)
+            self.assertEqual((run["status"], run["mode"], run["summary"]), ("ready", "claude", "Made the button bigger."))
+            self.assertEqual(seen["context"]["team"], "cl19 team")
+            self.assertEqual(set(seen["files"]), {"index.html", "styles.css", "app.js"})
+            self.assertEqual(owner.call(f"/teams/{tid}/agent", {"prompt": "again"})[0], 201)
+
+            def boom(*a):
+                raise server.AgentError("Claude declined this task. Try rephrasing what you'd like built.")
+            server.call_claude = boom
+            time.sleep(0.1)
+            rid2 = None
+            for _ in range(50):  # wait for the previous run to finish before starting another
+                st, data = owner.call(f"/teams/{tid}/agent", {"prompt": "something"})
+                if st == 201:
+                    rid2 = data["run"]["id"]
+                    break
+                time.sleep(0.05)
+            failed = self.wait_run(owner, tid, rid2)
+            self.assertEqual((failed["status"], failed["files"]), ("failed", None))
+            self.assertIn("declined", failed["error"])
+        finally:
+            server.call_claude = real
+            self.srv.agent_mode = None
+
+    def test_call_claude_request_and_reply_handling(self):
+        """Exercise call_claude against a stand-in SDK: the request shape and every reply branch."""
+        import sys
+        import types
+        sent = {}
+
+        class Block:
+            def __init__(self, text):
+                self.type, self.text = "text", text
+
+        reply = {}
+
+        class Stream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get_final_message(self):
+                return types.SimpleNamespace(stop_reason=reply["stop"], content=[Block(reply["text"])])
+
+        class Messages:
+            def stream(self, **kw):
+                sent.update(kw)
+                return Stream()
+
+        fake = types.ModuleType("anthropic")
+        for name in ("AuthenticationError", "RateLimitError", "APIStatusError", "APIConnectionError"):
+            setattr(fake, name, type(name, (Exception,), {}))
+        fake.Anthropic = lambda: types.SimpleNamespace(beta=types.SimpleNamespace(messages=Messages()))
+        sys.modules["anthropic"] = fake
+        try:
+            files = server.starter_files("Demo", "An idea")
+            reply.update(stop="end_turn", text=json.dumps({"summary": "Done.", "files": [{"path": "app.js", "content": "x()"}]}))
+            summary, changed = server.call_claude("Make it pop", files, {"team": "Demo"}, [])
+            self.assertEqual((summary, changed), ("Done.", {"app.js": "x()"}))
+            self.assertEqual(sent["model"], "claude-opus-5-5")
+            self.assertEqual((sent["fallbacks"], sent["betas"]), ("default", ["server-side-fallback-2026-07-01"]))
+            self.assertEqual(sent["output_config"]["format"]["schema"], server.AGENT_SCHEMA)
+            self.assertIn("<task>\nMake it pop\n</task>", sent["messages"][0]["content"])
+            self.assertIn('<file path="index.html">', sent["messages"][0]["content"])
+            for stop, text, msg in [("refusal", "", "declined"), ("max_tokens", "{", "too large"), ("end_turn", "not json", "couldn't be read"),
+                                    ("end_turn", json.dumps({"summary": "x", "files": [{"path": "../etc/passwd", "content": "x"}]}), "couldn't be read")]:
+                reply.update(stop=stop, text=text)
+                with self.assertRaises(server.AgentError) as cm:
+                    server.call_claude("t", files, {}, [])
+                self.assertIn(msg, str(cm.exception))
+        finally:
+            del sys.modules["anthropic"]
+
+    # ---------- builders directory ----------
+
+    def test_builders_directory_data(self):
+        people = self.client().ok("/people")["people"]
+        maya = next(p for p in people if p["name"] == "Maya Chen")
+        self.assertEqual((maya["city"], maya["country"], maya["title"], maya["experience"], maya["hours"], maya["collab"]),
+                         ("San Francisco", "United States", "Full-stack engineer", "Senior", 15, "Remote"))
+        self.assertEqual(maya["skills"], ["React", "TypeScript", "Next.js"])
+        self.assertEqual(sum(p["name"] == "Lena Fischer" for p in people), 1)  # no duplicate persona
+        self.assertGreaterEqual(len(people), 50)
+        self.assertFalse(seed.seed_builders(self.db))  # idempotent
+        challenges = self.client().ok("/challenges")["challenges"]
+        berlin = next(c for c in challenges if c["title"] == "Berlin Build Weekend")
+        self.assertEqual((berlin["format"], berlin["location"], berlin["status"]), ("In person", "Berlin", "upcoming"))
+        self.assertIn("Code for a cooler planet", [c["title"] for c in challenges])
+        projects = self.client().ok("/projects")["projects"]
+        compass = next(p for p in projects if p["title"] == "Carbon Compass")
+        self.assertEqual((compass["stack"], compass["team_name"]), (["React", "TypeScript"], "Carbon Collective"))
+        teams = self.client().ok("/teams")["teams"]
+        self.assertIn("ai for good", next(t for t in teams if t["name"] == "Carbon Collective")["challenge_tags"])
+
+    def test_save_connect_and_profile_fields(self):
+        me = self.signup("saver20", title="Product designer", city="Lisbon", country="Portugal", experience="Senior",
+                         hours=15, collab="Hybrid", seeking="Co-founders")
+        prof = me.ok("/me")["user"]
+        self.assertEqual((prof["title"], prof["city"], prof["collab"], prof["hours"]), ("Product designer", "Lisbon", "Hybrid", 15))
+        self.assertEqual(me.call("/me", {"name": "S", "experience": "Wizard"})[0], 400)
+        me.ok("/me", {"name": "Saver", "hours": 30, "city": "Porto"})
+        prof = me.ok("/me")["user"]
+        self.assertEqual((prof["hours"], prof["city"], prof["title"]), (30, "Porto", "Product designer"))  # others kept
+        other = self.signup("savee20")
+        oid = other.ok("/me")["user"]["id"]
+        self.assertTrue(me.ok(f"/people/{oid}/save", {})["saved"])
+        self.assertEqual(me.ok("/saved")["saved"], [oid])
+        self.assertFalse(me.ok(f"/people/{oid}/save", {})["saved"])
+        self.assertEqual(me.call(f"/people/{prof['id']}/save", {})[0], 400)
+        r = me.ok(f"/people/{oid}/connect", {})
+        self.assertEqual((r["connected"], r["mutual"]), (True, False))
+        self.assertTrue(any("wants to connect" in n["text"] for n in other.ok("/notifications")["notifications"]))
+        self.assertTrue(other.ok(f"/people/{prof['id']}/connect", {})["mutual"])
+        self.assertEqual(me.ok("/saved")["connected"], [oid])
+        self.assertTrue(me.ok(f"/people/{oid}/connect", {})["already"])
+
+    def test_onboarding_checklist(self):
+        owner, mate, tid = self.shipped_team("onb21")
+        self.assertEqual(owner.ok(f"/teams/{tid}/room")["onboarding"], [])
+        owner.ok(f"/teams/{tid}/onboarding", {"step": "brief", "done": True})
+        self.assertEqual(owner.call(f"/teams/{tid}/onboarding", {"step": "nope", "done": True})[0], 400)
+        self.assertEqual(self.signup("onbout21").call(f"/teams/{tid}/onboarding", {"step": "brief", "done": True})[0], 403)
+        owner.ok(f"/teams/{tid}/doing", {"doing": "Writing tests"})
+        room = owner.ok(f"/teams/{tid}/room")
+        self.assertEqual(room["onboarding"], ["brief", "status"])  # status ticks itself once you've posted one
+        self.assertEqual(mate.ok(f"/teams/{tid}/room")["onboarding"], [])  # per person
+        self.assertEqual(room["build"]["note"], "Starter files")
+        owner.ok(f"/teams/{tid}/onboarding", {"step": "brief", "done": False})
+        self.assertEqual(owner.ok(f"/teams/{tid}/room")["onboarding"], ["status"])
+
+    # ---------- hackathon pages ----------
+
+    def test_real_luma_event_and_sponsors(self):
+        hacks = self.client().ok("/challenges")["challenges"]
+        ai = next(h for h in hacks if h["title"] == "AI Engineer New York Hackathon")
+        self.assertEqual((ai["format"], ai["location"], ai["luma_url"], ai["luma_status"], ai["is_real"]),
+                         ("In person", "New York", "https://luma.com/AIEngineerNYHackathon", "Waitlist", True))
+        self.assertEqual(ai["food"], [])  # no invented logistics for a real event
+        detail = self.client().ok(f"/challenges/{ai['id']}")
+        self.assertEqual(detail["sponsors"], [])  # flyer sponsors are not attached to the real event
+        berlin = next(h for h in hacks if h["title"] == "Berlin Build Weekend")
+        d = self.client().ok(f"/challenges/{berlin['id']}")
+        offers = [x["offer"] for x in d["sponsors"]]
+        self.assertIn("Best Use of Gemma 4", offers)
+        self.assertEqual([x["offer"] for x in d["sponsors"] if x["name"] == "Major League Hacking"],
+                         ["Global Hack Week", "Host a Hack Day for your community"])
+        self.assertTrue(d["challenge"]["food"] and "Doors open" in d["challenge"]["info"])
+        self.assertGreaterEqual(len(d["people"]), 5)
+        self.assertFalse(seed.seed_hackathons(self.db))  # idempotent
+
+    def test_attend_people_and_scoped_floor(self):
+        u = self.signup("attendee22", skills=["go"])
+        ch = self.live_challenge(u)
+        other = next(c for c in u.ok("/challenges?status=live")["challenges"] if c["id"] != ch["id"])
+        self.assertTrue(u.ok(f"/challenges/{ch['id']}/attend", {})["attending"])
+        d = u.ok(f"/challenges/{ch['id']}")
+        self.assertTrue(d["attending"])
+        me = next(p for p in d["people"] if p["handle"] == "attendee22")
+        self.assertIsNone(me["team"])
+        u.ok("/teams", {"challenge_id": ch["id"], "name": "Gophers"})
+        me = next(p for p in u.ok(f"/challenges/{ch['id']}")["people"] if p["handle"] == "attendee22")
+        self.assertEqual(me["team"]["name"], "Gophers")
+        self.assertFalse(u.ok(f"/challenges/{ch['id']}/attend", {})["attending"])
+        # The Floor, scoped: check in and post on one hackathon; the other doesn't show it.
+        u.ok("/floor/checkin", {"status": "Wiring gRPC", "challenge_id": ch["id"]})
+        u.ok("/posts", {"kind": "update", "text": "Gophers shipped login", "challenge_id": ch["id"]})
+        here = u.ok(f"/floor?challenge_id={ch['id']}")
+        self.assertIn("Wiring gRPC", [h["status"] for h in here["here"]])
+        self.assertIn("Gophers shipped login", [p["text"] for p in here["posts"]])
+        elsewhere = u.ok(f"/floor?challenge_id={other['id']}")
+        self.assertNotIn("attendee22", [h["handle"] for h in elsewhere["here"]])
+        self.assertNotIn("Gophers shipped login", [p["text"] for p in elsewhere["posts"]])
+        self.assertIn("Gophers shipped login", [p["text"] for p in u.ok("/floor")["posts"]])  # unscoped = everything
+
+    def test_linkedin_and_luma_validation(self):
+        u = self.signup("linked23")
+        self.assertEqual(u.call("/me", {"name": "L", "linkedin": "https://evil.example/in/x"})[0], 400)
+        self.assertEqual(u.call("/me", {"name": "L", "linkedin": "javascript:alert(1)"})[0], 400)
+        u.ok("/me", {"name": "L", "linkedin": "https://www.linkedin.com/in/linked-23"})
+        self.assertEqual(u.ok("/me")["user"]["linkedin"], "https://www.linkedin.com/in/linked-23")
+        sp = self.signup("lumasp23", role="sponsor", org="Luma Co")
+        t = now()
+        self.assertEqual(sp.call("/challenges", {"title": "x", "format": "In person", "luma_url": "https://evil.test/e", "starts_at": t, "ends_at": t + DAY})[0], 400)
+        ch = sp.ok("/challenges", {"title": "Meetup Hack", "format": "In person", "location": "Lisbon",
+                                   "luma_url": "https://lu.ma/meetup-hack", "starts_at": t, "ends_at": t + DAY})["challenge"]
+        self.assertEqual((ch["format"], ch["location"], ch["luma_url"]), ("In person", "Lisbon", "https://lu.ma/meetup-hack"))
+
+    def test_finished_hackathon_lists_demos(self):
+        past = self.client().ok("/challenges?status=past")["challenges"]
+        with_demo = [h for h in past if self.client().ok(f"/challenges/{h['id']}")["demos"]]
+        self.assertTrue(with_demo)
+        d = self.client().ok(f"/challenges/{with_demo[0]['id']}")
+        self.assertEqual(d["demos"][0]["status"], "past")
+        self.assertTrue(d["submissions"])
 
     def test_cannot_join_past_challenge(self):
         c = self.signup("late4")

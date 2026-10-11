@@ -133,15 +133,32 @@ async function refreshMe() {
 
 // ---------- shared components ----------
 
+const fmtRange = (c) => {
+  const day = (ts) => new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  const a = day(c.starts_at);
+  const b = day(c.ends_at);
+  return a === b ? a : `${a.replace(/, \d{4}$/, '')} – ${b}`;
+};
+const formatPill = (c) => `<span class="fmt-pill">${c.format === 'In person' ? '📍 In person' : '🌐 Online'}</span>`;
+const lumaLabel = (c) => (c.luma_status === 'Waitlist' ? 'Join waitlist on Luma' : 'RSVP on Luma');
+
+// A hackathon in the list. In-person events can link out to their Luma page for RSVP.
 function challengeCard(c) {
-  return `<a class="card challenge-card" href="#/c/${c.id}" style="--c:${esc(c.sponsor.color)}">
-    <div class="row spread"><span class="sponsor">${esc(c.sponsor.name)}</span>${pill(c.status)}</div>
-    <h3>${esc(c.title)}</h3>
-    <p class="muted small" style="margin:0">${esc(c.summary)}</p>
-    ${c.prize ? `<div class="prize">${esc(c.prize)}</div>` : ''}
-    ${chips(c.tags)}
-    <div class="meta"><span>${c.team_count} teams · ${c.hacker_count} hackers</span><span>${timing(c)}</span></div>
-  </a>`;
+  return `<article class="card challenge-card ${c.is_real ? 'real-event' : ''}" style="--c:${esc(c.sponsor.color)}">
+    <a class="card-art" href="#/c/${c.id}" tabindex="-1" aria-hidden="true"><span class="art-label">${esc(c.is_real ? 'Real event · Luma' : c.tags[0] || 'Open hackathon')}</span>
+      <div class="orbital"><span></span><span></span><span></span></div>
+      <span class="art-num">${esc(c.sponsor.name.toUpperCase())}</span><span class="art-pill">${formatPill(c)} ${pill(c.status)}</span></a>
+    <div class="card-body">
+      <span class="sponsor">${esc(fmtRange(c))}${c.time_label ? ` · ${esc(c.time_label)}` : ''} · ${esc(c.location || 'Worldwide')}</span>
+      <h3><a href="#/c/${c.id}">${esc(c.title)}</a></h3>
+      <p class="muted small" style="margin:0">${esc(c.summary)}</p>
+      ${c.prize ? `<div class="prize">${esc(c.prize)}</div>` : ''}
+      <div class="meta"><span>${c.status === 'past' ? 'Ended' : timing(c)}</span><span>${c.team_count} teams · ${c.hacker_count} hackers</span></div>
+      <div class="card-actions"><a class="btn sm ghost" href="#/c/${c.id}">View hackathon ↗</a>
+        ${c.luma_url ? `<a class="btn sm luma" href="${esc(c.luma_url)}" target="_blank" rel="noopener noreferrer">${lumaLabel(c)} ↗</a>` : ''}</div>
+      ${c.is_real ? `<p class="rsvp-note"><b>${c.luma_status === 'Waitlist' ? 'Waitlist at last check' : 'Registration on Luma'}</b>${c.verified_at ? ` · checked ${esc(c.verified_at)}` : ''}. Luma has current availability.</p>` : ''}
+    </div>
+  </article>`;
 }
 
 function joinAction(t, ctx = {}) {
@@ -217,85 +234,163 @@ const judgeBadge = (s) => s.judge_count ? `<span class="chip hit" title="${s.jud
 
 // ---------- views ----------
 
+// The hero's neural-ribbon illustration (two glowing orbits around a bright core).
+function neuralArt() {
+  const strands = (n, cy, rx, ry, w, fade) => Array.from({ length: n }, (_, i) =>
+    `<ellipse cx="300" cy="${cy + i * 2}" rx="${rx}" ry="${ry}" stroke="url(#edge)" stroke-width="${w}" opacity="${(fade - i * (fade / n)).toFixed(3)}"/>`).join('');
+  return `<div class="neural-art" aria-hidden="true"><svg viewBox="0 0 600 600" fill="none">
+    <defs>
+      <linearGradient id="ribbon" x1="60" y1="100" x2="530" y2="450" gradientUnits="userSpaceOnUse"><stop stop-color="#8cf0ff"/><stop offset=".25" stop-color="#2666ff"/><stop offset=".55" stop-color="#7245f8"/><stop offset=".8" stop-color="#ffa9d4"/><stop offset="1" stop-color="#ff643a"/></linearGradient>
+      <radialGradient id="core"><stop stop-color="#fff"/><stop offset=".28" stop-color="#c3cbff"/><stop offset=".72" stop-color="#7567f7"/><stop offset="1" stop-color="#445beb" stop-opacity="0"/></radialGradient>
+      <filter id="glow"><feGaussianBlur stdDeviation="10"/></filter>
+      <linearGradient id="edge"><stop stop-color="#fff"/><stop offset=".5" stop-color="#bde9ff"/><stop offset="1" stop-color="#9a75ff"/></linearGradient>
+    </defs>
+    <circle cx="300" cy="300" r="185" fill="url(#core)" opacity=".36"/>
+    <g opacity=".3" stroke="#778bdf"><circle cx="300" cy="300" r="240" stroke-dasharray="3 12"/><circle cx="300" cy="300" r="204"/><path d="M30 300H570M300 30V570" stroke-dasharray="2 8"/></g>
+    <g transform="rotate(-32 300 300)"><ellipse cx="300" cy="300" rx="205" ry="95" stroke="url(#ribbon)" stroke-width="46" opacity=".35" filter="url(#glow)"/><ellipse cx="300" cy="300" rx="205" ry="95" stroke="url(#ribbon)" stroke-width="36"/><ellipse cx="300" cy="282" rx="204" ry="93" stroke="url(#edge)" stroke-width="1.5" opacity=".85"/>${strands(16, 286, 204, 95, .55, .65)}</g>
+    <g transform="rotate(42 300 300)"><ellipse cx="300" cy="300" rx="180" ry="89" stroke="url(#ribbon)" stroke-width="32"/><ellipse cx="300" cy="285" rx="179" ry="88" stroke="url(#edge)" stroke-width="1.8"/>${strands(15, 287, 179, 89, .5, .6)}</g>
+    <circle cx="300" cy="300" r="15" fill="white" filter="url(#glow)"/><circle cx="300" cy="300" r="4" fill="white"/>
+    <g fill="#4065ed"><circle cx="87" cy="175" r="4"/><circle cx="482" cy="143" r="3"/><circle cx="470" cy="456" r="5"/></g>
+  </svg></div>`;
+}
+
 async function viewHome() {
-  const [stats, live, upcoming, show, sponsors, demos] = await Promise.all([
+  const [stats, live, upcoming, show, sponsors, demos, looking] = await Promise.all([
     api('/stats'), api('/challenges?status=live'), api('/challenges?status=upcoming'),
-    api('/showcase'), api('/sponsors'), api('/demos')]);
+    api('/showcase'), api('/sponsors'), api('/demos'), api('/people?looking=1')]);
   const soonDemos = demos.demos.filter((d) => d.status !== 'past').slice(0, 3);
-  const lines = [
-    ...live.challenges.slice(0, 4).map((c) =>
-      `<div class="line"><span class="tag">● live</span><span>${esc(c.title)}</span><span class="dim">ends <span data-until="${c.ends_at}">${until(c.ends_at)}</span></span></div>`),
-    ...upcoming.challenges.slice(0, 2).map((c) =>
-      `<div class="line"><span class="tag">○ next</span><span>${esc(c.title)}</span><span class="dim">in <span data-until="${c.starts_at}">${until(c.starts_at)}</span></span></div>`),
-    ...soonDemos.map((d) => `<div class="line"><span class="tag">▶ demo</span><span>${esc(d.title)}</span><span class="dim">${d.status === 'live' ? 'on now' : 'in <span data-until="' + d.starts_at + '">' + until(d.starts_at) + '</span>'}</span></div>`),
-    `<div class="line"><span class="tag">● floor</span><span>${stats.here_now} hacking right now · ${stats.open_help} hands raised</span></div>`,
-    `<div class="line"><span class="tag">◆ team</span><span>${stats.looking} hackers looking for teammates</span></div>`,
-    `<div class="line"><span class="dim">$ always --on</span></div>`,
-  ];
+  const liveDemo = soonDemos.find((d) => d.status === 'live');
+  const endingSoon = [...live.challenges].sort((a, b) => a.ends_at - b.ends_at)[0];
+  const seeker = looking.people[0];
+  const missing = await missingPieceSection().catch(() => '');
+  const liveTop = [...live.challenges].sort((a, b) => a.ends_at - b.ends_at).slice(0, 4);
+  // Floating cards show what's actually happening right now.
+  const f1 = liveDemo
+    ? `<a class="floating f1" href="${liveDemo.stage ? `#/t/${liveDemo.team_id}/stage` : '#/demos'}"><span class="fi">🎬</span><span><strong>${esc(liveDemo.team_name)} is demoing</strong><small>Live now · join the audience</small></span><i class="dot"></i></a>`
+    : endingSoon ? `<a class="floating f1" href="#/c/${endingSoon.id}"><span class="fi">⏱</span><span><strong>${esc(endingSoon.title)}</strong><small>ends in <span data-until="${endingSoon.ends_at}">${until(endingSoon.ends_at)}</span></small></span><i class="dot"></i></a>` : '';
+  const f2 = seeker ? `<a class="floating f2" href="#/u/${esc(seeker.handle)}">${avatar(seeker)}<span><strong>${esc(seeker.name.split(' ')[0])} is looking for a team</strong><small>${esc(seeker.skills.slice(0, 2).join(' · ') || 'Open to anything')}</small></span><i class="dot"></i></a>` : '';
+  const f3 = `<a class="floating f3" href="#/challenges"><span class="fi" style="color:#6853dd">✳</span><span><strong>${stats.here_now} hacking right now</strong><small>${stats.open_help} hands raised on the Floor</small></span></a>`;
   return `
   <section class="hero">
     <div>
-      <h1>There's <em>always</em> a hackathon happening.</h1>
-      <p class="lede">Rolling sponsor challenges and a fresh open sprint every Monday. Find a team in minutes, ship something this week, win prizes.</p>
+      <span class="live-label"><i class="dot"></i>THERE’S ALWAYS SOMETHING LIVE</span>
+      <h1>Your next big idea<br>starts with<br><em>a stranger.</em><span class="hero-star">✳</span></h1>
+      <p class="lede">Rolling sponsor challenges and a fresh open sprint every Monday. Find a team in minutes, ship something this week, demo it live.</p>
       <div class="row">
-        <a class="btn lg" href="#/teams">Find a team</a>
-        <a class="btn lg ghost" href="#/floor"><span class="dot"></span>Walk onto the floor${stats.here_now ? ` · ${stats.here_now} here` : ''}</a>
+        <a class="btn lg" href="#/teams">Find your teammates ↗</a>
+        <a class="btn lg ghost" href="#/challenges">Explore hackathons →</a>
       </div>
-      ${me ? '' : '<p class="small muted" style="margin-top:12px">No application, no waitlist. <a href="#/join">Join in 30 seconds →</a></p>'}
+      ${me ? '' : '<p class="hero-note">No application, no waitlist. <a href="#/join">Join in 30 seconds →</a></p>'}
     </div>
-    <div class="ticker" aria-label="Live activity">${lines.join('')}</div>
+    <div class="hero-visual">${neuralArt()}<span class="coordinate c1">ONE WORLD · MANY TIME ZONES</span><span class="visual-tag">● ALWAYS CONNECTED</span>${f1}${f2}${f3}</div>
   </section>
-  <div class="stats">
-    <div class="stat"><b>${stats.live}</b><span>live challenges</span></div>
-    <div class="stat"><b>${stats.hackers}</b><span>hackers</span></div>
-    <div class="stat"><b>${stats.looking}</b><span>looking for a team</span></div>
-    <div class="stat"><b>${stats.teams}</b><span>teams formed</span></div>
-    <div class="stat"><b>${stats.submissions}</b><span>projects shipped</span></div>
+  <div class="stats-strip">
+    <span><strong>${stats.live}</strong>live challenges</span>
+    <span><strong>${stats.hackers}</strong>hackers</span>
+    <span><strong>${stats.looking}</strong>looking for a team</span>
+    <span><strong>${stats.teams}</strong>teams formed</span>
+    <span><strong>${stats.submissions}</strong>projects shipped</span>
   </div>
+  ${missing}
   <section class="section">
-    <div class="section-head"><h2>Live now</h2><a href="#/challenges">All challenges →</a></div>
-    <div class="grid">${live.challenges.map(challengeCard).join('') || empty('Nothing live — check back Monday.')}</div>
+    <div class="section-head"><div><span class="eyebrow">Less scrolling. More shipping.</span><h2>Hackathons live right now.</h2><p>Online and in person. Pick one, find a crew, beat the clock.</p></div><a href="#/challenges">All hackathons ↗</a></div>
+    <div class="grid fill">${liveTop.map(challengeCard).join('') || empty('Nothing live — check back Monday.')}</div>
   </section>
   ${soonDemos.length ? `<section class="section">
-    <div class="section-head"><h2>Demos on Zoom</h2><a href="#/demos">All demos →</a></div>
+    <div class="section-head"><div><span class="eyebrow">Show, don’t tell</span><h2>Demos to watch.</h2></div></div>
     <div class="grid">${soonDemos.map((d) => demoCard(d)).join('')}</div></section>` : ''}
   ${upcoming.challenges.length ? `<section class="section">
-    <div class="section-head"><h2>Starting soon</h2></div>
-    <div class="grid">${upcoming.challenges.map(challengeCard).join('')}</div></section>` : ''}
+    <div class="section-head"><div><span class="eyebrow">The next starting line</span><h2>Starting soon.</h2><p>Teams can form before the clock starts.</p></div></div>
+    <div class="grid fill">${upcoming.challenges.slice(0, 4).map(challengeCard).join('')}</div></section>` : ''}
   <section class="section">
-    <div class="section-head"><h2>How it works</h2></div>
+    <div class="section-head"><div><span class="eyebrow">From “what if” to “we built this”</span><h2>How it works.</h2></div></div>
     <div class="grid steps">
       <div class="card flat"><h3>Pick a challenge</h3><p class="muted small" style="margin:0">Sponsor tracks run for a week or two, on a rolling schedule. The open sprint restarts every Monday.</p></div>
       <div class="card flat"><h3>Get matched</h3><p class="muted small" style="margin:0">Teams post the roles they need. We rank teams for you by role fit, new skills, interests and timezone.</p></div>
-      <div class="card flat"><h3>Ship &amp; get voted</h3><p class="muted small" style="margin:0">Submit before the clock runs out, demo live on Zoom, and get scored by judges and voted on by the community.</p></div>
+      <div class="card flat"><h3>Build &amp; demo live</h3><p class="muted small" style="margin:0">Build together in your Team Room with a coding agent, then demo on the stage and get scored by judges and the crowd.</p></div>
     </div>
   </section>
   ${show.projects.length ? `<section class="section">
-    <div class="section-head"><h2>Top projects</h2></div>
-    <div class="grid two">${show.projects.map((p, i) => `<div class="card project"><div class="rank">#${i + 1}</div><div class="body">
+    <div class="section-head"><div><span class="eyebrow">A weekend project. A future company.</span><h2>Top projects.</h2></div></div>
+    <div class="grid two">${show.projects.map((p, i) => `<div class="card project"><div class="rank">0${i + 1}</div><div class="body">
       <h3>${esc(p.title)}</h3><div class="small muted">${esc(p.team_name)} · <a href="#/c/${p.challenge_id}">${esc(p.challenge_title)}</a></div>
       <p class="small" style="margin:6px 0 0">${esc(p.description)}</p></div><div class="small muted">▲ ${p.votes}</div></div>`).join('')}</div>
   </section>` : ''}
-  <section class="section">
-    <div class="section-head"><h2>Sponsors</h2><a href="#/sponsor">Put your API in front of builders →</a></div>
-    <div class="sponsor-strip">${sponsors.sponsors.map((s) =>
-      `<span class="sponsor-chip" style="--c:${esc(s.color)}"><i></i>${esc(s.name)}</span>`).join('')}</div>
-  </section>`;
+  <section class="section community-banner"><span class="large-star">✳</span><div><span class="eyebrow">Built for ecosystems</span><h2>Your technology.<br>Their next big idea.</h2><p>Sponsors run rolling challenges and watch the funnel from views to shipped projects.</p></div>
+    <div class="stack"><div class="sponsor-strip">${sponsors.sponsors.map((s) => `<span class="sponsor-chip" style="--c:${esc(s.color)}"><i></i>${esc(s.name)}</span>`).join('')}</div>
+    <a class="btn" href="#/sponsor">Sponsor a challenge ↗</a></div></section>`;
 }
 
-async function viewChallenges(tab = 'live') {
-  const data = await api(`/challenges?status=${tab}`);
-  const tabs = [['live', 'Live'], ['upcoming', 'Upcoming'], ['past', 'Past']];
-  return `<div class="section-head"><h1 style="margin:0">Challenges</h1>
-    <nav class="tabs">${tabs.map(([k, l]) => `<a href="#/challenges/${k}" class="${k === tab ? 'on' : ''}">${l}</a>`).join('')}</nav></div>
-    <div class="grid">${data.challenges.map(challengeCard).join('') || empty('Nothing here yet.')}</div>`;
+let hackFilters = { q: '', format: 'All', theme: 'All' };
+
+async function viewChallenges(tab) {
+  tab = ['live', 'upcoming', 'past', 'all'].includes(tab) ? tab : 'live';
+  const data = await api(tab === 'all' ? '/challenges' : `/challenges?status=${tab}`);
+  const tabs = [['live', 'Live'], ['upcoming', 'Upcoming'], ['past', 'Past'], ['all', 'All']];
+  const themes = ['All', ...new Set(data.challenges.map((c) => c.tags[0]).filter(Boolean))];
+  const paint = () => {
+    const f = hackFilters;
+    const list = data.challenges.filter((c) => (f.format === 'All' || c.format === f.format) && (f.theme === 'All' || c.tags[0] === f.theme)
+      && [c.title, c.location, c.sponsor.name, ...c.tags].join(' ').toLowerCase().includes(f.q.toLowerCase()));
+    document.getElementById('hack-grid').innerHTML = list.map(challengeCard).join('')
+      || `<div class="empty" style="grid-column:1/-1"><h3>No hackathons match these filters.</h3><button class="btn ghost" type="button" data-hf="reset">Reset filters</button></div>`;
+    document.getElementById('hack-count').textContent = list.length;
+  };
+  return [`<div class="page-intro"><span class="eyebrow">The next chapter starts here</span><h1>Make something happen.</h1>
+      <p>Online sprints and in-person weekends, all year round. In-person events link to Luma for RSVP.</p></div>
+    <div class="directory-toolbar">
+      <label class="search-box"><span aria-hidden="true">⌕</span><input id="hack-q" aria-label="Search hackathons" placeholder="Search hackathons or cities…" value="${esc(hackFilters.q)}"></label>
+      <select id="hack-format" aria-label="Format" style="width:auto;margin:0">${['All', 'Online', 'In person'].map((x) => `<option ${hackFilters.format === x ? 'selected' : ''}>${x}</option>`).join('')}</select>
+      <select id="hack-theme" aria-label="Theme" style="width:auto;margin:0">${themes.map((x) => `<option ${hackFilters.theme === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>
+    </div>
+    <nav class="tabs" style="margin-bottom:22px">${tabs.map(([k, l]) => `<a href="#/challenges/${k}" class="${k === tab ? 'on' : ''}">${l}</a>`).join('')}
+      <span class="small muted" style="margin-left:auto;align-self:center"><b id="hack-count">0</b> hackathons</span></nav>
+    <div class="grid fill" id="hack-grid"></div>`, () => {
+    paint();
+    document.getElementById('hack-q').addEventListener('input', (e) => { hackFilters.q = e.target.value; paint(); });
+    document.getElementById('hack-format').addEventListener('change', (e) => { hackFilters.format = e.target.value; paint(); });
+    document.getElementById('hack-theme').addEventListener('change', (e) => { hackFilters.theme = e.target.value; paint(); });
+    document.getElementById('hack-grid').addEventListener('click', (e) => {
+      if (e.target.closest('[data-hf="reset"]')) { hackFilters = { q: '', format: 'All', theme: 'All' }; render(); }
+    });
+  }];
 }
 
-async function viewChallenge(id) {
-  const d = await api(`/challenges/${id}`);
+function videoEmbed(url) {
+  try {
+    const u = new URL(url);
+    const yt = u.hostname === 'youtu.be' ? u.pathname.slice(1) : /(^|\.)youtube\.com$/.test(u.hostname) ? u.searchParams.get('v') : null;
+    if (yt && /^[\w-]{11}$/.test(yt)) return `<iframe src="https://www.youtube-nocookie.com/embed/${yt}" title="Opening video" allow="fullscreen; picture-in-picture" allowfullscreen></iframe>`;
+    const vimeo = /(^|\.)vimeo\.com$/.test(u.hostname) && u.pathname.match(/(\d+)\/?$/)?.[1];
+    if (vimeo) return `<iframe src="https://player.vimeo.com/video/${vimeo}" title="Opening video" allow="fullscreen" allowfullscreen></iframe>`;
+    if (u.protocol === 'https:' && /\.(mp4|webm|ogg)$/i.test(u.pathname)) return `<video src="${esc(url)}" controls playsinline></video>`;
+  } catch (e) { /* not a URL */ }
+  return '';
+}
+
+function personTile(p) {
+  return `<article class="person-tile" data-b="profile" data-id="${p.id}" tabindex="0" role="button" aria-label="Open ${esc(p.name)}'s profile">
+    ${avatar(p, 'lg')}<div class="who"><b>${esc(p.name)}</b><small>${esc(p.title || 'Builder')}${p.city ? ` · ${esc(p.city)}` : ''}</small>
+    ${p.team ? `<span class="chip">🧩 ${esc(p.team.name)}</span>` : '<span class="chip need">Looking for a team</span>'}</div>
+    ${p.linkedin ? `<a class="li-link" href="${esc(p.linkedin)}" target="_blank" rel="noopener noreferrer" aria-label="${esc(p.name)} on LinkedIn" data-stop>in</a>` : ''}
+  </article>`;
+}
+
+function demoListItem(d) {
+  const watch = d.stage ? `<a class="btn sm ${d.status === 'live' ? 'live-btn' : 'ghost'}" href="#/t/${d.team_id}/stage">${d.status === 'live' ? '▶ Watch live' : d.status === 'past' ? 'Demo recap ↗' : 'Stage ↗'}</a>`
+    : d.status === 'past' ? '<span class="small muted">Zoom demo · ended</span>' : `<button class="btn sm" data-act="watch" data-id="${d.id}">${d.status === 'live' ? 'Join on Zoom ↗' : "I'll watch"}</button>`;
+  return `<div class="card demo-row">${pill(d.status === 'past' ? 'past' : d.status)}<div class="who"><b>${esc(d.title)}</b>
+    <div class="small muted"><a href="#/t/${d.team_id}">${esc(d.team_name)}</a> · ${new Date(d.starts_at * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}${d.peak ? ` · ${d.peak} watching at peak` : ''}</div></div>${watch}</div>`;
+}
+
+async function viewChallenge(id, params) {
+  const [d, f] = await Promise.all([api(`/challenges/${id}`), api(`/floor?challenge_id=${id}`)]);
   const c = d.challenge;
   const ctx = { myTeamId: d.my_team_id, pending: d.pending_team_ids };
   const myTeam = d.teams.find((t) => t.id === d.my_team_id);
+  const tabs = [['overview', 'Overview'], ['floor', '● The Floor'], ['teams', `Teams · ${d.teams.length}`], ['people', `People · ${d.people.length}`],
+    ['demos', c.status === 'past' ? `Demos · ${d.demos.length + d.submissions.length}` : 'Demos & projects']];
+  const tab = tabs.some(([k]) => k === params?.get('tab')) ? params.get('tab') : c.status === 'past' ? 'demos' : 'overview';
   let side = '';
   if (myTeam) {
     side = `<div class="card"><h3>You're on ${esc(myTeam.name)}</h3><p class="small muted">${myTeam.members.length}/${myTeam.max_size} members</p>
@@ -309,56 +404,117 @@ async function viewChallenge(id) {
         .map((n) => `<option ${n === c.max_team ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
       <button class="btn" type="submit">Create team</button></form>`;
   } else if (!me && c.status !== 'past') {
-    side = `<div class="card"><h3>Want in?</h3><p class="small muted">Create a profile to start a team or request to join one.</p><a class="btn" href="#/join">Join</a></div>`;
+    side = `<div class="card"><h3>Want in?</h3><p class="small muted">Create a profile to join, start a team, or walk onto the floor.</p><a class="btn" href="#/join">Join</a></div>`;
   }
+  const host = c.sponsor;
+  const sponsorCards = [
+    ...(host.id ? [{ name: host.name, color: host.color, tier: c.is_real ? 'Organizer' : 'Host sponsor', offer: c.title, details: host.tagline, link: host.product_url || host.website, host: true }] : []),
+    ...d.sponsors,
+  ];
+  const video = c.video_url ? videoEmbed(c.video_url) : '';
+  const food = c.food.length ? `<ul class="food">${c.food.map((x) => `<li><span class="mono">${esc(x.time)}</span><div><b>${esc(x.item)}</b><small>${esc(x.detail)}</small></div></li>`).join('')}</ul>`
+    : c.is_real ? `<p class="muted small" style="margin:0">Food, venue and schedule are managed by the organizers. <a href="${esc(c.luma_url)}" target="_blank" rel="noopener noreferrer">See the Luma page ↗</a></p>`
+      : '<p class="muted small" style="margin:0">Nothing listed yet.</p>';
+  const overview = `<div class="split"><div class="stack">
+      <div class="card flat"><span class="eyebrow">About</span><p class="desc" style="margin:0 0 12px">${esc(c.description)}</p>${chips(c.tags)}</div>
+      <div class="card"><span class="eyebrow">Information & instructions</span>
+        ${c.venue || c.time_label ? `<p class="small" style="margin:0 0 10px">${c.time_label ? `🕘 ${esc(c.time_label)} · ` : ''}${c.venue ? `📍 ${esc(c.venue)}` : esc(c.location)}</p>` : ''}
+        <p class="desc" style="margin:0">${esc(c.info || 'Details coming soon.')}</p>${c.is_real ? '<p class="small muted" style="margin:10px 0 0">This listing reflects the organizer’s Luma page; Luma is authoritative.</p>' : ''}</div>
+      <div class="card"><span class="eyebrow">Opening ceremony</span>${video ? `<div class="video-frame">${video}</div>`
+        : `<div class="video-frame empty-video"><b>▶</b><span>${c.status === 'upcoming' ? 'The opening ceremony streams when the hackathon starts.' : 'The opening video appears here when the organizers post it.'}</span></div>`}</div>
+      <div class="card"><span class="eyebrow">Sponsors & partners</span>${sponsorCards.length ? `<div class="sponsor-grid">${sponsorCards.map((x) => `<div class="sponsor-card" style="--c:${esc(x.color || '#6750eb')}">
+          <span class="tier">${esc(x.tier)}</span><b>${esc(x.name)}</b><span class="offer">${esc(x.offer)}</span>${x.details ? `<small>${esc(x.details)}</small>` : ''}
+          ${x.host && (host.product_url || c.resource_url) ? `<button class="btn sm ghost" data-act="try" data-id="${c.id}">Try ${esc(x.name)} ↗</button>`
+            : x.link ? `<a class="small" href="${esc(x.link)}" target="_blank" rel="noopener noreferrer">${esc(x.link.replace(/^https?:\/\//, ''))} ↗</a>` : ''}</div>`).join('')}</div>`
+        : '<p class="muted small" style="margin:0">No sponsors listed.</p>'}
+        ${d.perks.length ? `<div class="stack" style="margin-top:14px">${d.perks.map(perkCard).join('')}</div>` : ''}</div>
+    </div><aside class="stack">${side}
+      <div class="card"><span class="eyebrow">Food & beverage</span>${food}</div>
+      <div class="card flat small"><b>Rules of the road</b><ul style="padding-left:18px;margin:8px 0 0" class="muted">
+        <li>Start fresh: code written during the hackathon.</li><li>One team per hacker per hackathon.</li>
+        <li>Submit a repo or demo link before the deadline.</li><li>Be kind. Help beginners.</li></ul></div>
+    </aside></div>`;
+  const teams = `<div class="split"><div class="grid two">${d.teams.map((t) => teamCard(t, { action: c.status === 'past' ? '' : joinAction(t, ctx) })).join('')
+      || empty('No teams yet — be the first.')}</div><aside class="stack">${side}</aside></div>`;
+  const people = `<div class="row spread" style="margin-bottom:14px"><p class="muted small" style="margin:0">Everyone who joined or is on a team. Click someone to see their profile${me ? ', connect, or invite them' : ''}.</p>
+      <input id="people-q" placeholder="Filter by name, skill or city…" style="max-width:280px;margin:0"></div>
+    <div class="people-grid" id="people-grid">${d.people.map(personTile).join('') || empty(c.is_real ? 'Join on Luma, then mark yourself as attending here to meet other builders.' : 'Nobody yet — join and be the first.')}</div>`;
+  const past = c.status === 'past';
+  const demos = `<section><div class="section-head"><div><span class="eyebrow">${past ? 'The show is over — the demos live on' : 'Show, don’t tell'}</span><h2>${past ? 'Demos from this hackathon.' : 'Demos.'}</h2></div></div>
+      <div class="stack">${d.demos.map(demoListItem).join('') || empty(past ? 'No recorded demos for this hackathon.' : 'No demos scheduled yet — teams go live from their Team Room.')}</div></section>
+    <section class="section"><div class="section-head"><div><span class="eyebrow">Community vote</span><h2>Projects.</h2></div></div>
+      <div class="stack">${d.submissions.map((s, i) => `<div class="card project">
+        <div class="rank">${String(i + 1).padStart(2, '0')}</div>
+        <div class="body"><div class="row"><h3 style="margin:0">${esc(s.title)}</h3>${judgeBadge(s)}</div><div class="small muted">by <a href="#/t/${s.team_id}">${esc(s.team_name)}</a></div>
+          <p class="small" style="margin:6px 0">${esc(s.description)}</p>
+          <div class="row small">${s.repo_url ? `<a href="${esc(s.repo_url)}" target="_blank" rel="noopener">Repo ↗</a>` : ''}
+          ${s.demo_url ? `<a href="${esc(s.demo_url)}" target="_blank" rel="noopener">Try the demo ↗</a>` : ''}<a href="#/t/${s.team_id}/stage">Demo stage ↗</a></div></div>
+        <button class="btn vote ${s.voted ? 'on' : ''}" data-act="vote" data-id="${s.id}" aria-label="Vote"><span>▲</span><b>${s.votes}</b></button>
+      </div>`).join('') || empty('No projects yet.')}</div></section>`;
   const html = `
   <div class="banner" style="--c:${esc(c.sponsor.color)}">
-    <div class="row"><span class="pill">${{ live: '● Live', upcoming: 'Starting soon', past: 'Ended' }[c.status]}</span><b>${esc(c.sponsor.name)}</b></div>
+    <div class="row"><span class="pill">${{ live: '● Live', upcoming: 'Starting soon', past: 'Ended' }[c.status]}</span>${formatPill(c)}<b>${esc(c.sponsor.name)}</b></div>
     <h1>${esc(c.title)}</h1>
-    <p style="opacity:.9;max-width:60ch;margin:0 0 14px">${esc(c.summary)}</p>
+    <p style="max-width:62ch;margin:0 0 6px">${esc(c.summary)}</p>
+    <p class="small" style="margin:0 0 16px;opacity:.85">📅 ${esc(fmtRange(c))}${c.time_label ? ` · ${esc(c.time_label)}` : ''} · 📍 ${esc(c.location || 'Worldwide')}</p>
     <div class="row" style="position:relative;z-index:1">
-      ${c.sponsor.product_url || c.resource_url ? `<button class="btn" data-act="try" data-id="${c.id}">Try ${esc(c.sponsor.name)} →</button>` : ''}
-      ${c.resource_url ? `<a class="btn ghost" href="${esc(c.resource_url)}" target="_blank" rel="noopener">Docs</a>` : ''}
+      ${c.luma_url ? `<a class="btn luma" href="${esc(c.luma_url)}" target="_blank" rel="noopener noreferrer">${lumaLabel(c)} ↗</a>` : ''}
+      ${me && me.role === 'hacker' && c.status !== 'past' ? `<button class="btn ${c.luma_url ? 'ghost' : ''}" data-hk="attend">${d.attending ? '✓ You’re in' : c.luma_url ? 'Mark me as attending' : 'Join this hackathon'}</button>` : ''}
+      ${c.status !== 'past' ? `<button class="btn ghost" data-hk="floor"><span class="dot"></span>Walk onto the floor${f.here.length ? ` · ${f.here.length} here` : ''}</button>` : ''}
     </div>
     <div class="banner-meta">
       ${c.prize ? `<div><span>Prize</span><b>${esc(c.prize)}</b></div>` : ''}
       <div><span>${c.status === 'upcoming' ? 'Starts in' : c.status === 'live' ? 'Ends in' : 'Ended'}</span><b>${c.status === 'past' ? fmtDate(c.ends_at)
         : `<span class="countdown" data-until="${c.status === 'upcoming' ? c.starts_at : c.ends_at}">…</span>`}</b></div>
       <div><span>Teams</span><b>${c.team_count}</b></div>
-      <div><span>Hackers</span><b>${c.hacker_count}</b></div>
+      <div><span>People</span><b>${d.people.length}</b></div>
       <div><span>Team size</span><b>1–${c.max_team}</b></div>
     </div>
   </div>
-  <div class="split section" style="margin-top:24px">
-    <div>
-      <div class="card flat"><h2>About</h2><p class="desc">${esc(c.description)}</p>${chips(c.tags)}</div>
-      <section class="section">
-        <div class="section-head"><h2>Teams</h2><span class="muted small">${d.teams.filter((t) => t.open).length} with open spots</span></div>
-        <div class="grid two">${d.teams.map((t) => teamCard(t, { action: c.status === 'past' ? '' : joinAction(t, ctx) })).join('')
-          || empty('No teams yet — be the first.')}</div>
-      </section>
-      <section class="section">
-        <div class="section-head"><h2>Projects</h2><span class="muted small">Community vote</span></div>
-        <div class="stack">${d.submissions.map((s, i) => `<div class="card project">
-          <div class="rank">#${i + 1}</div>
-          <div class="body"><div class="row"><h3 style="margin:0">${esc(s.title)}</h3>${judgeBadge(s)}</div><div class="small muted">by <a href="#/t/${s.team_id}">${esc(s.team_name)}</a></div>
-            <p class="small" style="margin:6px 0">${esc(s.description)}</p>
-            <div class="row small">${s.repo_url ? `<a href="${esc(s.repo_url)}" target="_blank" rel="noopener">Repo ↗</a>` : ''}
-            ${s.demo_url ? `<a href="${esc(s.demo_url)}" target="_blank" rel="noopener">Demo ↗</a>` : ''}</div></div>
-          <button class="btn vote ${s.voted ? 'on' : ''}" data-act="vote" data-id="${s.id}" aria-label="Vote"><span>▲</span><b>${s.votes}</b></button>
-        </div>`).join('') || empty('No projects yet.')}</div>
-      </section>
-    </div>
-    <aside class="stack">${side}
-      ${d.demos.length ? `<div class="stack"><h3 style="margin:8px 0 0">Demos</h3>${d.demos.map((x) => demoCard(x)).join('')}</div>` : ''}
-      ${d.perks.length ? `<div class="card"><h3>Sponsor support</h3><div class="stack">${d.perks.map(perkCard).join('')}</div></div>` : ''}
-      <div class="card flat small"><b>Rules of the road</b><ul style="padding-left:18px;margin:8px 0 0" class="muted">
-        <li>Start fresh: code written during the challenge window.</li><li>One team per hacker per challenge.</li>
-        <li>Submit a repo or demo link before the deadline.</li><li>Be kind. Help beginners.</li></ul></div>
-    </aside>
+  <nav class="tabs section hack-tabs" role="tablist" style="margin-top:24px">${tabs.map(([k, l]) => `<button type="button" role="tab" data-tab="${k}" class="${k === tab ? 'on' : ''}">${l}</button>`).join('')}</nav>
+  <div class="section" style="margin-top:22px">
+    <div data-pane="overview" ${tab === 'overview' ? '' : 'hidden'}>${overview}</div>
+    <div data-pane="floor" ${tab === 'floor' ? '' : 'hidden'}>${floorSection(f, c)}</div>
+    <div data-pane="teams" ${tab === 'teams' ? '' : 'hidden'}>${teams}</div>
+    <div data-pane="people" ${tab === 'people' ? '' : 'hidden'}>${people}</div>
+    <div data-pane="demos" ${tab === 'demos' ? '' : 'hidden'}>${demos}</div>
   </div>`;
   return [html, () => {
     app.querySelectorAll('[data-until]').forEach((el) => { el.textContent = until(+el.dataset.until); });
+    const show = (k) => {
+      app.querySelectorAll('.hack-tabs [data-tab]').forEach((b) => b.classList.toggle('on', b.dataset.tab === k));
+      app.querySelectorAll('[data-pane]').forEach((p) => { p.hidden = p.dataset.pane !== k; });
+      history.replaceState(null, '', `#/c/${c.id}?tab=${k}`);
+      if (k === 'floor') startFloor(c.id);
+    };
+    app.querySelector('.hack-tabs').addEventListener('click', (e) => { const b = e.target.closest('[data-tab]'); if (b) show(b.dataset.tab); });
+    if (tab === 'floor') startFloor(c.id);
+    app.querySelector('.banner').addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-hk]');
+      if (!b) return;
+      if (b.dataset.hk === 'floor') {
+        show('floor');
+        const input = app.querySelector('#checkin [name=status]');
+        app.querySelector('[data-pane="floor"]').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        input?.focus();
+      } else if (b.dataset.hk === 'attend') {
+        try {
+          const r = await api(`/challenges/${c.id}/attend`, {});
+          toast(r.attending ? `You're in for ${c.title} 🎉` : 'Removed from the attendee list');
+          render();
+        } catch (err) { toast(err.message, true); }
+      }
+    });
+    const pq = app.querySelector('#people-q');
+    pq?.addEventListener('input', () => {
+      const q = pq.value.toLowerCase();
+      app.querySelectorAll('#people-grid .person-tile').forEach((el) => { el.hidden = q && !el.textContent.toLowerCase().includes(q); });
+    });
+    app.querySelector('#people-grid')?.addEventListener('keydown', (e) => {
+      const t = e.target.closest('.person-tile');
+      if (t && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openBuilderProfile(+t.dataset.id); }
+    });
+    bindFloor(c.id);
     onSubmit('#new-team', async (v) => {
       const r = await api('/teams', { ...v, challenge_id: c.id, looking_for: splitList(v.looking_for), max_size: +v.max_size });
       await refreshMe();
@@ -375,8 +531,7 @@ async function viewTeams() {
     api('/challenges'),
   ]);
   const open = ch.challenges.filter((c) => c.status !== 'past');
-  let html = `<h1>Find a team</h1>
-    <p class="muted" style="max-width:60ch">Teams post the roles they need. Request to join, or start your own on any challenge and invite people.</p>`;
+  let html = `<div class="page-intro"><span class="eyebrow">Better, together</span><h1>Find your missing piece.</h1><p>Teams post the roles they need. Request to join, or start your own on any challenge and invite people.</p></div>`;
   if (match) {
     html += `<section class="section"><div class="section-head"><h2>Recommended for you</h2>
       <a class="small" href="#/me">Tune your skills →</a></div>
@@ -497,7 +652,7 @@ async function viewTeam(id) {
 async function viewPeople(params) {
   const q = params.get('q') || '', skill = params.get('skill') || '', looking = params.get('looking') === '1';
   const data = await api(`/people?q=${encodeURIComponent(q)}&skill=${encodeURIComponent(skill)}&looking=${looking ? 1 : ''}`);
-  return [`<h1>Hackers</h1>
+  return [`<div class="page-intro"><span class="eyebrow">Your people are out there</span><h1>Meet the builders.</h1><p>Different skills, shared ambition. Filter by skill or find people still looking for a team.</p></div>
     <form class="row" id="pf" style="margin:16px 0 20px">
       <input name="q" placeholder="Search name, bio, skill…" value="${esc(q)}" style="flex:2;min-width:180px;margin:0">
       <input name="skill" placeholder="Exact skill, e.g. react" value="${esc(skill)}" style="flex:1;min-width:140px;margin:0">
@@ -539,7 +694,7 @@ async function viewDemos() {
   const d = await api('/demos');
   const by = (st) => d.demos.filter((x) => x.status === st);
   const sec = (title, list, none) => `<section class="section"><h2>${title}</h2><div class="grid">${list.map((x) => demoCard(x)).join('') || empty(none)}</div></section>`;
-  return `<h1>Demos</h1><p class="muted" style="max-width:60ch">Teams demo live on Zoom. You'll get a notification when a new demo is scheduled — hit “I'll watch” to save it.</p>
+  return `<div class="page-intro"><span class="eyebrow">Show, don’t tell</span><h1>Demos to watch.</h1><p>Teams demo live on their in-app stage or on Zoom. You get a notification when one starts.</p></div>
     ${sec('Live now', by('live'), 'No one is on stage right now.')}
     ${sec('Coming up', by('upcoming'), 'Nothing scheduled yet. On a team? Schedule one from your team page.')}
     ${by('past').length ? sec('Earlier today', by('past'), '') : ''}`;
@@ -593,7 +748,6 @@ async function viewJudge() {
 
 let floorTimer = null;
 let floorFilter = 'all';
-let floorVisibilityBound = false;
 
 function whoLine(u) {
   const where = u.org ? `<span class="chip org">${esc(u.org)}</span>` : u.role === 'judge' ? '<span class="chip org">judge</span>'
@@ -635,7 +789,14 @@ function floorFeed(f) {
 }
 
 async function viewFloor() {
-  const f = await api('/floor');
+  // The Floor now lives inside each hackathon. The old link goes to the always-live Open Sprint's floor.
+  const live = (await api('/challenges?status=live')).challenges;
+  const target = live.find((c) => !c.sponsor.id) || live[0];
+  location.hash = target ? `#/c/${target.id}?tab=floor` : '#/challenges';
+  return '';
+}
+
+function floorSection(f, c) {
   const openHelp = f.posts.filter((p) => p.kind === 'help' && !p.resolved_by).length;
   const checkin = !me ? `<div class="card checkin"><b>This is the hacking floor.</b> <span class="muted">See who's building right now, share progress, and raise your hand when you're stuck.</span>
       <a class="btn" href="#/join">Join to walk in</a></div>`
@@ -645,11 +806,10 @@ async function viewFloor() {
     : `<form class="card checkin" id="checkin"><input name="status" maxlength="120" placeholder="What are you working on right now?" required>
       <button class="btn" type="submit">Walk onto the floor</button></form>`;
   const tabs = [['all', 'Everything'], ['help', `Hands raised${openHelp ? ` (${openHelp})` : ''}`], ['update', 'Ship log']];
-  return [`<div class="row spread"><div><h1 style="margin:0">The Floor</h1>
-      <p class="muted" style="margin:4px 0 0">The room at 2am, online. Who's building, what shipped, who's stuck.</p></div></div>
-    <div class="split section" style="margin-top:20px"><div class="stack">
-      ${checkin}
-      ${me ? `<form class="card stack" id="composer">
+  return `<p class="muted" style="margin:0 0 16px">The room at 2am, online — who’s building ${esc(c.title)} right now, what just shipped, and who could use a hand.</p>
+    <div class="split"><div class="stack">
+      ${c.status === 'past' ? '<div class="notice">This hackathon has ended — the floor is read-only history.</div>' : checkin}
+      ${me && c.status !== 'past' ? `<form class="card stack" id="composer">
         <nav class="tabs"><button type="button" class="on" data-kind="update">📦 Ship update</button><button type="button" data-kind="help">🙋 Raise your hand</button></nav>
         <textarea name="text" required maxlength="500" rows="2" placeholder="What did you just get working?"></textarea>
         <label data-help hidden>What skills could help?<input name="tags" placeholder="react, auth, swift"><div class="hint">People on the floor with these skills (and matching sponsors) get a tap on the shoulder.</div></label>
@@ -657,45 +817,45 @@ async function viewFloor() {
       </form>` : ''}
       <nav class="tabs" id="floor-tabs">${tabs.map(([k, l]) => `<button type="button" data-filter="${k}" class="${k === floorFilter ? 'on' : ''}">${l}</button>`).join('')}</nav>
       <div class="stack" id="floor-feed">${floorFeed(f)}</div>
-    </div><aside class="card" id="floor-here">${floorHere(f)}</aside></div>`, () => {
-    const refresh = async () => {
-      const next = await api('/floor');
-      // Only touch the DOM when something changed, so buttons don't vanish mid-click.
-      for (const [id, html] of [['floor-feed', floorFeed(next)], ['floor-here', floorHere(next)]]) {
-        const el = document.getElementById(id);
-        if (el && el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
-      }
+    </div><aside class="card" id="floor-here">${floorHere(f)}</aside></div>`;
+}
+
+// Poll the floor while its tab is open (render() clears the timer when you navigate away).
+function startFloor(cid) {
+  clearInterval(floorTimer);
+  const refresh = async () => {
+    if (app.querySelector('[data-pane="floor"]')?.hidden) return;
+    const next = await api(`/floor?challenge_id=${cid}`);
+    for (const [id, html] of [['floor-feed', floorFeed(next)], ['floor-here', floorHere(next)]]) {
+      const el = document.getElementById(id);
+      if (el && el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+    }
+  };
+  floorTimer = setInterval(() => { if (!document.hidden) refresh().catch(() => {}); }, 8000);
+}
+
+function bindFloor(cid) {
+  app.querySelectorAll('#floor-tabs [data-filter]').forEach((b) => {
+    b.onclick = () => { floorFilter = b.dataset.filter; render(); };
+  });
+  onSubmit('#checkin', async (v) => { await api('/floor/checkin', { ...v, challenge_id: cid }); await refreshMe(); toast('You\'re on the floor 👋'); render(); });
+  const comp = app.querySelector('#composer');
+  if (!comp) return;
+  let kind = 'update';
+  comp.querySelectorAll('[data-kind]').forEach((b) => {
+    b.onclick = () => {
+      kind = b.dataset.kind;
+      comp.querySelectorAll('[data-kind]').forEach((x) => x.classList.toggle('on', x === b));
+      comp.querySelector('[data-help]').hidden = kind !== 'help';
+      comp.text.placeholder = kind === 'help' ? 'What are you stuck on? Error messages welcome.' : 'What did you just get working?';
+      comp.querySelector('[data-hint]').textContent = kind === 'help' ? 'Someone on the floor has probably hit this before.' : 'Small wins count. Posting keeps your team visible.';
     };
-    document.getElementById('floor-feed').dataset.html = floorFeed(f);
-    document.getElementById('floor-here').dataset.html = floorHere(f);
-    floorTimer = setInterval(() => { if (!document.hidden) refresh().catch(() => {}); }, 8000);
-    if (!floorVisibilityBound) {
-      floorVisibilityBound = true;
-      document.addEventListener('visibilitychange', () => { if (!document.hidden && location.hash.startsWith('#/floor')) render(); });
-    }
-    app.querySelectorAll('#floor-tabs [data-filter]').forEach((b) => {
-      b.onclick = () => { floorFilter = b.dataset.filter; render(); };
-    });
-    onSubmit('#checkin', async (v) => { await api('/floor/checkin', v); await refreshMe(); toast('You\'re on the floor 👋'); render(); });
-    const comp = app.querySelector('#composer');
-    if (comp) {
-      let kind = 'update';
-      comp.querySelectorAll('[data-kind]').forEach((b) => {
-        b.onclick = () => {
-          kind = b.dataset.kind;
-          comp.querySelectorAll('[data-kind]').forEach((x) => x.classList.toggle('on', x === b));
-          comp.querySelector('[data-help]').hidden = kind !== 'help';
-          comp.text.placeholder = kind === 'help' ? "What are you stuck on? Error messages welcome." : 'What did you just get working?';
-          comp.querySelector('[data-hint]').textContent = kind === 'help' ? 'Someone on the floor has probably hit this before.' : 'Small wins count. Posting keeps your team visible.';
-        };
-      });
-      onSubmit('#composer', async (v) => {
-        await api('/posts', { kind, text: v.text, tags: splitList(v.tags) });
-        toast(kind === 'help' ? 'Hand raised — tapping the right shoulders 🙋' : 'Posted 📦');
-        render();
-      });
-    }
-  }];
+  });
+  onSubmit('#composer', async (v) => {
+    await api('/posts', { kind, text: v.text, tags: splitList(v.tags), challenge_id: cid });
+    toast(kind === 'help' ? 'Hand raised — tapping the right shoulders 🙋' : 'Posted 📦');
+    render();
+  });
 }
 
 async function viewInbox() {
@@ -708,7 +868,7 @@ async function viewInbox() {
     <div class="row" style="margin-top:8px">${actions}</div></div></div>`;
   const decide = (r) => `<button class="btn sm" data-act="decide" data-id="${r.id}" data-action="accept">Accept</button>
     <button class="btn sm ghost" data-act="decide" data-id="${r.id}" data-action="decline">Decline</button>`;
-  return `<h1>Inbox</h1>
+  return `<div class="page-intro"><span class="eyebrow">Make the first move</span><h1>Inbox.</h1><p>Invites for you, requests to join your teams, and what you’ve sent.</p></div>
     <section class="section"><h2>Invites for you</h2><div class="stack">${d.invites.map((r) => item(r, decide(r))).join('') || empty('No invites yet. <a href="#/me">Make sure “looking for a team” is on.</a>')}</div></section>
     <section class="section"><h2>Requests to join your teams</h2><div class="stack">${d.join_requests.map((r) => item(r, decide(r))).join('') || empty('Nothing pending.')}</div></section>
     <section class="section"><h2>Sent</h2><div class="stack">${d.outgoing.map((r) => item(r,
@@ -724,13 +884,20 @@ async function viewProfile() {
     <label>Bio<textarea name="bio" maxlength="280">${esc(me.bio)}</textarea></label>
     ${me.role === 'hacker' ? `<label>Skills<input name="skills" value="${esc(me.skills.join(', '))}" placeholder="python, react, design"><div class="hint">Comma-separated. Teams match on these.</div></label>
     <label>Interests<input name="interests" value="${esc(me.interests.join(', '))}" placeholder="ai, fintech, accessibility"></label>
+    <div class="form-grid"><label>Role<select name="title"><option value="">—</option>${B_ROLES.map((r) => `<option ${me.title === r ? 'selected' : ''}>${r}</option>`).join('')}</select></label>
+      <label>Experience<select name="experience"><option value="">—</option>${B_EXPERIENCE.map((r) => `<option ${me.experience === r ? 'selected' : ''}>${r}</option>`).join('')}</select></label>
+      <label>City<input name="city" maxlength="60" value="${esc(me.city)}"></label><label>Country<input name="country" maxlength="60" value="${esc(me.country)}"></label>
+      <label>Hours per week<input name="hours" type="number" min="0" max="80" value="${me.hours || ''}"></label>
+      <label>Collaboration<select name="collab"><option value="">—</option>${B_COLLAB.map((r) => `<option ${me.collab === r ? 'selected' : ''}>${r}</option>`).join('')}</select></label>
+      <label>Looking for<select name="seeking"><option value="">—</option>${B_SEEKING.map((r) => `<option ${me.seeking === r ? 'selected' : ''}>${r}</option>`).join('')}</select></label>
+      <label>LinkedIn<input name="linkedin" type="url" placeholder="https://www.linkedin.com/in/you" value="${esc(me.linkedin)}"></label></div>
     <label class="row"><input type="checkbox" name="looking" ${me.looking ? 'checked' : ''}>I'm looking for a team (show me to team owners)</label>` : ''}
     <div class="row"><button class="btn" type="submit">Save</button><button type="button" class="btn ghost" data-act="logout">Sign out</button></div>
   </form><aside class="stack"><div class="card flat"><div class="row">${avatar(me, 'lg')}<div><b>@${esc(me.handle)}</b><div class="small muted">${me.role}</div></div></div>
     <p class="small muted" style="margin:12px 0 0"><a href="#/u/${esc(me.handle)}">View public profile →</a></p>
     ${me.role === 'sponsor' ? '<p class="small" style="margin:8px 0 0"><a href="#/sponsor">Sponsor dashboard →</a></p>' : ''}</div></aside></div>`, () => {
     onSubmit('#profile', async (v) => {
-      await api('/me', { ...v, tz: +v.tz, skills: splitList(v.skills), interests: splitList(v.interests) });
+      await api('/me', { ...v, tz: +v.tz, hours: +v.hours || 0, skills: splitList(v.skills), interests: splitList(v.interests) });
       await refreshMe();
       toast('Profile saved');
     });
@@ -739,14 +906,15 @@ async function viewProfile() {
 
 async function viewSponsor() {
   if (!me || me.role !== 'sponsor') {
-    return `<section class="hero"><div><h1>Builders, <em>every week</em>. Not once a year.</h1>
+    return `<section class="hero"><div><span class="live-label"><i class="dot"></i>FOR SPONSORS & DEVREL</span>
+      <h1>Builders,<br><em>every week.</em><br>Not once a year.</h1>
       <p class="lede">Run a rolling challenge on your API. Hackers find your product, form teams around it, and ship real projects — while you watch the funnel.</p>
-      <div class="row"><a class="btn lg" href="#/join?sponsor=1">Launch a challenge</a>
+      <div class="row"><a class="btn lg" href="#/join?sponsor=1">Launch a challenge ↗</a>
       <button class="btn lg ghost" data-act="login-as" data-handle="nimbus">See a demo dashboard</button></div></div>
-      <div class="ticker"><div class="line"><span class="tag">views</span><span>who saw your challenge</span></div>
-      <div class="line"><span class="tag">clicks</span><span>who tried your product</span></div>
-      <div class="line"><span class="tag">teams</span><span>who built with it</span></div>
-      <div class="line"><span class="tag">skills</span><span>what your builders know</span></div></div></section>
+      <div class="hero-visual">${neuralArt()}
+        <div class="floating f1"><span class="fi">👀</span><span><strong>Views → clicks</strong><small>who saw it, who tried your product</small></span></div>
+        <div class="floating f2"><span class="fi">🛠</span><span><strong>Teams building on you</strong><small>and the skills they bring</small></span></div>
+        <div class="floating f3"><span class="fi" style="color:#6853dd">✳</span><span><strong>Shipped projects</strong><small>demoed live, scored by judges</small></span></div></div></section>
       <div class="grid steps section">
         <div class="card flat"><h3>Always-on reach</h3><p class="small muted" style="margin:0">Your challenge sits next to a live, weekly community instead of one weekend's crowd.</p></div>
         <div class="card flat"><h3>A funnel you can measure</h3><p class="small muted" style="margin:0">Page views → product clicks → teams → shipped projects, all on one dashboard.</p></div>
@@ -798,6 +966,9 @@ async function viewSponsor() {
         <label>Prize<input name="prize" maxlength="120" placeholder="$2,000 + credits"></label>
         <label>Tags<input name="tags" placeholder="ai, voice, mobile"><div class="hint">Matched against hacker interests.</div></label>
         <label>Docs / starter kit URL<input name="resource_url" type="url" placeholder="https://"></label>
+        <label>Format<select name="format"><option>Online</option><option>In person</option></select></label>
+        <label>Location<input name="location" maxlength="60" placeholder="Worldwide, or a city for in-person"></label>
+        <label>Luma event page<input name="luma_url" type="url" placeholder="https://luma.com/your-event"><div class="hint">In-person events: RSVPs happen on Luma.</div></label>
         <label>Max team size<input name="max_team" type="number" min="1" max="8" value="4"></label>
         <label>Starts<input name="starts" type="datetime-local" required value="${localIso(nextMon)}"></label>
         <label>Length (days)<input name="days" type="number" min="1" max="60" value="7"></label>
@@ -916,6 +1087,7 @@ async function awaitApproval(el, tid, seconds) {
 
 const actions = {
   menu: () => nav.classList.toggle('open'),
+  buildmate: () => bmToggle(true),
   async logout() { await api('/logout', {}); me = null; renderNav(); location.hash = '#/'; },
   'login-as': (el) => login(el.dataset.handle),
   scroll: (el) => document.getElementById(el.dataset.target)?.scrollIntoView({ behavior: 'smooth' }),
@@ -1014,13 +1186,14 @@ document.addEventListener('click', async (e) => {
 
 const routes = [
   [/^$/, viewHome],
-  [/^challenges(?:\/(live|upcoming|past))?$/, viewChallenges],
+  [/^(?:challenges|hackathons)(?:\/(live|upcoming|past|all))?$/, viewChallenges],
   [/^c\/(\d+)$/, viewChallenge],
   [/^teams$/, viewTeams],
   [/^t\/(\d+)$/, viewTeam],
   [/^t\/(\d+)\/room$/, viewRoom],
   [/^t\/(\d+)\/stage$/, viewStage],
-  [/^people$/, viewPeople],
+  [/^people$/, viewBuilders],
+  [/^builders$/, viewBuilders],
   [/^u\/([a-z0-9_-]+)$/, viewPerson],
   [/^inbox$/, viewInbox],
   [/^demos$/, viewDemos],
@@ -1052,7 +1225,7 @@ function renderNav() {
   const path = location.hash.replace(/^#\/?/, '').split(/[/?]/)[0];
   const link = (href, label, extra = '') =>
     `<a href="#/${href}" class="${path === href.split('/')[0] ? 'active' : ''}">${label}${extra}</a>`;
-  let html = myTeamNav() + link('floor', '<span class="dot"></span>The Floor') + link('challenges', 'Challenges') + link('teams', 'Find a team') + link('demos', 'Demos') + link('people', 'Hackers') + link('sponsor', 'Sponsors');
+  let html = myTeamNav() + link('challenges', 'Hackathons') + link('teams', 'Find a team') + link('builders', 'Find a builder');
   if (me) {
     if (me.role === 'judge') html += link('judge', 'Judging');
     if (me.role === 'hacker') html += link('inbox', 'Inbox', me.inbox ? `<span class="badge">${me.inbox}</span>` : '');
@@ -1112,4 +1285,5 @@ setInterval(async () => {
 }, 20000);
 
 startClock();
+mountBuildmate();
 refreshMe().catch(() => {}).finally(render);

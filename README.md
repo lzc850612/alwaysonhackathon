@@ -9,7 +9,7 @@ python3 server.py            # http://127.0.0.1:8000 (demo data is loaded on fir
 python3 -m unittest -v       # API tests
 ```
 
-No dependencies: Python 3.8+ standard library, SQLite and a plain-JS single-page frontend. To reset the demo data, delete `data/` and restart.
+No dependencies: Python 3.8+ standard library, SQLite and a plain-JS single-page frontend. The optional `anthropic` SDK turns on the real Build lab agent. The UI uses a light theme: a pale canvas, blue→violet gradients, soft white cards and a neural-ribbon hero. To reset the demo data, delete `data/` and restart.
 
 **Demo mode is on by default:** a request to join a team approves itself after **2 seconds**, as if the owner had clicked Accept, and drops you into the Team Room. The usual checks still apply: if the team filled up in the meantime, the request waits for the owner. Turn it off for real use:
 
@@ -39,6 +39,35 @@ Demo accounts (sign-in is by handle only in this MVP): `ben` (has an invite), `l
 - **Call:** camera is opt-in and off by default. **Hold to talk** (button or Space bar) un-mutes your mic only while held, and talkers are highlighted. Audio and video go directly between teammates' browsers (WebRTC); the server only passes the connection setup between them (`/room/heartbeat`, `/room/signal`), and nothing is recorded. Camera and mic need HTTPS, or `localhost`.
 - **Transcript:** while you hold to talk, your browser's built-in speech recognition turns your words into text. Teammates see live captions on your tile, and finished phrases are saved to the team transcript (Download .txt / Clear). It's per person (📝 *Transcribe me*, default on, remembered), and words still unfinished when you let go are kept. Chrome sends the audio to Google's servers to convert it; Firefox has no speech recognition, so the switch shows as unavailable there.
 
+**Hackathons** (`#/challenges`): the list has search, an **Online / In person** filter, a theme filter and Live / Upcoming / Past / All tabs. In-person events can link to their **Luma** page ("RSVP on Luma" / "Join waitlist on Luma"); sponsors set the link when creating a hackathon (only `luma.com` / `lu.ma` links are accepted). The list includes the real **AI Engineer New York Hackathon** (Oct 11, 2026, 9 AM–9 PM EDT, hosted by AI Engineer & Major League Hacking, on the waitlist when checked). Its page shows only facts from the organizer's Luma listing and points there for venue, food and schedule.
+
+Each **hackathon page** (`#/c/<id>`) has tabs:
+- **Overview:** about, information & instructions, opening video (YouTube, Vimeo or MP4 when set), sponsors & partners, food & beverage, rules.
+- **The Floor:** presence, ship log and help requests, scoped to this hackathon, with **Walk onto the floor** in the header.
+- **Teams.**
+- **People:** everyone who joined or is on a team. Clicking a person opens their profile, including LinkedIn if they've added it; LinkedIn links are never invented for demo people.
+- **Demos & projects:** after a hackathon ends, this tab opens first with its recorded demos and projects.
+
+The fictional hackathons list partner offers from MLH sponsor flyers: Major League Hacking (Global Hack Week, Host a Hack Day), Snowflake, Google's Gemma 4 challenge, DigitalOcean's Hackerfest and DEV. None of these are attached to the real event.
+
+**Build lab** (the **✦ Build lab** tab in the Team Room) is the team's shared prototype plus a coding agent.
+- **Shared project:** three files (`index.html`, `styles.css`, `app.js`), saved as versions everyone on the team sees. Edit them by hand in **Code**, or **restore** any earlier version (the restore is saved as a new version, so nothing is lost).
+- **Agent tasks:** you describe a change. The agent reads the team's context (name, idea, challenge, submission, recent tasks) and the current files, then *proposes* complete file changes.
+- **Review:** **Changes** shows a line diff, and nothing lands until a teammate clicks **Apply** (or **Discard**). If the files changed after the task started, applying asks first.
+- **Preview:** **Preview** runs the real files inside a sandboxed iframe (`sandbox="allow-scripts"` without `allow-same-origin`), so prototype code can't reach this app, its cookies or its API.
+- **Two agent modes:**
+  - **Claude**: used when the `anthropic` Python SDK is installed and credentials are set. It calls `claude-opus-5-5` through the official SDK, with streaming, a strict JSON output schema (`{summary, files[]}`), prompt caching and server-side refusal fallbacks (`fallbacks: "default"`), and refusal and length handling. The key stays on the server.
+  - **Simulated**: used otherwise. It applies built-in templates (landing page / progress dashboard / accessibility pass) to the team's real context, and every reply says it's simulated.
+- **Limits:** one running task per team, 20 tasks per person per hour.
+
+To run the real agent (the SDK needs Python 3.10+):
+
+```bash
+pip install anthropic
+export ANTHROPIC_API_KEY=sk-ant-...   # or ANTHROPIC_AUTH_TOKEN / an `ant auth login` profile
+python3 server.py                     # AOH_AGENT=simulated forces templates; AOH_AGENT=claude forces Claude
+```
+
 **Finish → Demo Stage**: the end of the build-to-demo flow.
 - **🏁 Finish & go to demo** (Team Room, any team member): confirms the submission (pre-filled), marks the team **Shipped**, and closes the roster. The team drops out of "Find a team" and matching, pending requests and invites are withdrawn (those people are told), and teammates are notified. Any member can **Reopen** while the challenge runs.
 - **Demo Stage** (`#/t/<id>/stage`) runs the demo inside the app, no Zoom needed. Presenters (team members) set up privately first (🖥 **share screen**, 📷 camera as a small inset, 🎙 microphone that stays on while presenting), then **🔴 Go live**. Everyone is notified, and the demo appears on Demos with "▶ Watch live".
@@ -67,6 +96,7 @@ python3 server.py --live-ritual closing   # or kickoff, checkin
 
 ```
 server.py        HTTP server, SQLite schema, every API route
+static/buildlab.js  Team Room build lab: agent thread, preview sandbox, diff review, versions
 seed.py          fictional demo data (dates relative to now)
 static/          index.html, app.js (hash-routed SPA), styles.css (light + dark)
 test_server.py   end-to-end API tests

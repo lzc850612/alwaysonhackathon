@@ -25,6 +25,7 @@ function leaveRoom() {
   const r = room;
   room = null;
   clearInterval(r.refreshTimer);
+  r.stopLab?.();
   clearInterval(r.beatTimer);
   clearInterval(r.meterTimer);
   window.removeEventListener('keydown', r.onKey);
@@ -469,8 +470,9 @@ function previewMeta(p) {
   return p.url ? `Pushed by @${esc(p.by)} ${ago(p.at)} · blank? Some sites refuse to be embedded — use ↗` : '';
 }
 
-async function viewRoom(id) {
+async function viewRoom(id, params) {
   if (!me) { location.hash = '#/join'; return ''; }
+  const startTab = params?.get?.('tab') === 'lab' ? 'lab' : 'room';
   const d = await api(`/teams/${id}/room`);
   const t = d.team;
   const html = `<div class="room-page"><div class="row spread"><div><div class="row small muted"><a href="#/t/${t.id}">← ${esc(t.name)}</a>${pill(t.challenge_status)}
@@ -480,6 +482,10 @@ async function viewRoom(id) {
       <span class="small muted">Share your screen, go live, and everyone can watch and ask questions.</span></div>
       <div class="row"><a class="btn live-btn" href="#/t/${t.id}/stage">🎬 Go to demo stage</a>
       ${t.challenge_status === 'live' ? '<button class="btn ghost sm" type="button" data-finish="reopen">Reopen</button>' : ''}</div></div>` : ''}
+    <nav class="tabs room-tabs section" role="tablist" aria-label="Team room views">
+      <button type="button" role="tab" data-room-tab="room">🚪 Room</button>
+      <button type="button" role="tab" data-room-tab="lab">✦ Build lab</button></nav>
+    <div data-room-pane="room">
     <div class="room-grid section" style="margin-top:18px">
       <section class="card browser">
         <form class="urlbar" id="preview-form"><span class="lights"><i></i><i></i><i></i></span>
@@ -503,7 +509,8 @@ async function viewRoom(id) {
     <div class="grid two section">
       <div class="card"><h3>What everyone's doing</h3><div id="doing">${doingPanel(d)}</div></div>
       <div class="card"><h3>Team timeline</h3><div id="timeline">${timelinePanel(d)}</div></div>
-    </div></div>`;
+    </div></div>
+    <div data-room-pane="lab" hidden><div id="build-lab"></div></div></div>`;
 
   return [html, () => {
     const r = room = {
@@ -645,6 +652,18 @@ async function viewRoom(id) {
     };
     window.addEventListener('keydown', r.onKey);
     window.addEventListener('keyup', r.onKey);
+    // Tabs only hide/show panes, so a call keeps running while you're in the Build lab.
+    const showTab = (tab) => {
+      document.querySelectorAll('[data-room-tab]').forEach((b) => b.classList.toggle('on', b.dataset.roomTab === tab));
+      document.querySelectorAll('[data-room-pane]').forEach((p) => { p.hidden = p.dataset.roomPane !== tab; });
+      if (tab === 'lab' && !r.stopLab) r.stopLab = mountBuildLab(document.getElementById('build-lab'), t);
+      history.replaceState(null, '', `#/t/${t.id}/room${tab === 'lab' ? '?tab=lab' : ''}`);
+    };
+    document.querySelector('.room-tabs').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-room-tab]');
+      if (b) showTab(b.dataset.roomTab);
+    });
+    showTab(startTab);
     r.onHide = () => leaveRoom();
     window.addEventListener('pagehide', r.onHide);
   }];

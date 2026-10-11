@@ -97,8 +97,8 @@ async function viewLiveHub() {
     : c.next ? `<div class="card ritual-hero"><div class="muted small">Next up</div><h2>${RITUAL_ICON[c.next.key]} ${esc(c.next.title)}</h2>
         <div class="big-countdown" data-until="${c.next.starts_at}">${until(c.next.starts_at)}</div>
         <p class="muted" style="margin:0">${localDay(c.next.starts_at)} at ${localTime(c.next.starts_at)} · ${esc(c.next.blurb)}</p></div>` : '';
-  return `<div class="row spread"><div><h1 style="margin:0">The shared clock</h1>
-      <p class="muted" style="margin:4px 0 0;max-width:62ch">Always-on doesn't mean always empty. Three rituals a week bring everyone into the same moment — show up and the room is full.</p></div>
+  return `<div class="row spread"><div class="page-intro"><span class="eyebrow">Always on, never empty</span><h1>The shared clock.</h1>
+      <p>Three rituals a week bring everyone into the same moment — show up and the room is full.</p></div>
       <a class="btn ghost" href="/api/clock.ics" download>📅 Add to calendar</a></div>
     <div class="grid section" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))">${hero}</div>
     <div class="grid section steps" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr))">

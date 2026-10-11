@@ -137,6 +137,32 @@ CREATE TABLE IF NOT EXISTS stage_presence(
 CREATE TABLE IF NOT EXISTS stage_questions(
   id INTEGER PRIMARY KEY, demo_id INTEGER NOT NULL REFERENCES demos(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL REFERENCES users(id), text TEXT NOT NULL, answered INTEGER DEFAULT 0, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS build_versions(
+  id INTEGER PRIMARY KEY, team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE, note TEXT NOT NULL,
+  files TEXT NOT NULL, user_id INTEGER REFERENCES users(id), created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_runs(
+  id INTEGER PRIMARY KEY, team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id), prompt TEXT NOT NULL, status TEXT NOT NULL, mode TEXT NOT NULL,
+  summary TEXT DEFAULT '', files TEXT, error TEXT DEFAULT '', base_version INTEGER, created_at INTEGER NOT NULL,
+  finished_at INTEGER);
+CREATE INDEX IF NOT EXISTS idx_build_versions_team ON build_versions(team_id, id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_team ON agent_runs(team_id, id);
+CREATE TABLE IF NOT EXISTS saved_builders(
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, builder_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL, PRIMARY KEY(user_id, builder_id));
+CREATE TABLE IF NOT EXISTS connections(
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, other_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL, PRIMARY KEY(user_id, other_id));
+CREATE TABLE IF NOT EXISTS onboarding(
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  steps TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(team_id, user_id));
+CREATE TABLE IF NOT EXISTS hackathon_sponsors(
+  challenge_id INTEGER NOT NULL REFERENCES challenges(id) ON DELETE CASCADE, sponsor_id INTEGER NOT NULL REFERENCES sponsors(id),
+  tier TEXT DEFAULT 'Partner', offer TEXT NOT NULL DEFAULT '', details TEXT DEFAULT '', link TEXT DEFAULT '', sort INTEGER DEFAULT 0,
+  PRIMARY KEY(challenge_id, sponsor_id, offer));
+CREATE TABLE IF NOT EXISTS attendees(
+  challenge_id INTEGER NOT NULL REFERENCES challenges(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL, PRIMARY KEY(challenge_id, user_id));
 CREATE TABLE IF NOT EXISTS ritual_notices(occ_id TEXT NOT NULL, phase TEXT NOT NULL, PRIMARY KEY(occ_id, phase));
 CREATE INDEX IF NOT EXISTS idx_transcripts_team ON transcripts(team_id, id);
 CREATE INDEX IF NOT EXISTS idx_signals_to ON signals(team_id, to_session, id);
@@ -185,7 +211,35 @@ MIGRATIONS = [
     "ALTER TABLE demos ADD COLUMN stage INTEGER DEFAULT 0",
     "ALTER TABLE demos ADD COLUMN ended_at INTEGER",
     "ALTER TABLE demos ADD COLUMN peak INTEGER DEFAULT 0",
+    # Builder profile fields (the directory and Buildmate filter on these).
+    "ALTER TABLE users ADD COLUMN title TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN city TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN country TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN experience TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN hours INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN collab TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN seeking TEXT DEFAULT ''",
+    "ALTER TABLE challenges ADD COLUMN format TEXT DEFAULT 'Online'",
+    "ALTER TABLE challenges ADD COLUMN location TEXT DEFAULT 'Worldwide'",
+    "ALTER TABLE submissions ADD COLUMN stack TEXT DEFAULT '[]'",
+    # Hackathon details: Luma for in-person events, practical info, food, the opening video.
+    "ALTER TABLE challenges ADD COLUMN luma_url TEXT DEFAULT ''",
+    "ALTER TABLE challenges ADD COLUMN luma_status TEXT DEFAULT ''",
+    "ALTER TABLE challenges ADD COLUMN time_label TEXT DEFAULT ''",
+    "ALTER TABLE challenges ADD COLUMN venue TEXT DEFAULT ''",
+    "ALTER TABLE challenges ADD COLUMN info TEXT DEFAULT ''",
+    "ALTER TABLE challenges ADD COLUMN food TEXT DEFAULT '[]'",
+    "ALTER TABLE challenges ADD COLUMN video_url TEXT DEFAULT ''",
+    "ALTER TABLE challenges ADD COLUMN is_real INTEGER DEFAULT 0",
+    "ALTER TABLE challenges ADD COLUMN verified_at TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN linkedin TEXT DEFAULT ''",
+    "ALTER TABLE presence ADD COLUMN challenge_id INTEGER",
+    "ALTER TABLE posts ADD COLUMN challenge_id INTEGER",
 ]
+ROLE_TITLES = ("Full-stack engineer", "AI / ML engineer", "Product designer", "Backend engineer", "Frontend engineer")
+EXPERIENCE = ("Early career", "Mid-level", "Senior")
+COLLAB = ("Remote", "Hybrid", "Local")
+SEEKING = ("Teammates", "Co-founders")
 
 
 def init_db(path):
@@ -219,6 +273,12 @@ def ensure_open_sprint(db, t=None):
          "and post it for the community vote. The top three projects get featured on the home page.",
          "Featured project + swag pack", json.dumps(["open", "anything", "beginner-friendly"]),
          starts_at, starts_at + 7 * DAY, now()))
+    new_id = db.execute("SELECT id FROM challenges WHERE sponsor_id IS NULL AND starts_at=?", (starts_at,)).fetchone()[0]
+    prev = db.execute("SELECT id FROM challenges WHERE sponsor_id IS NULL AND starts_at<? ORDER BY starts_at DESC LIMIT 1",
+                      (starts_at,)).fetchone()
+    if prev and db.execute("SELECT name FROM sqlite_master WHERE name='hackathon_sponsors'").fetchone():
+        db.execute("INSERT OR IGNORE INTO hackathon_sponsors(challenge_id,sponsor_id,tier,offer,details,link,sort)"
+                   " SELECT ?,sponsor_id,tier,offer,details,link,sort FROM hackathon_sponsors WHERE challenge_id=?", (new_id, prev[0]))
 
 
 # ---------- input helpers ----------
@@ -295,7 +355,42 @@ def zoom_url(body, key):
 def user_out(r):
     return {"id": r["id"], "handle": r["handle"], "name": r["name"], "bio": r["bio"],
             "skills": jl(r["skills"]), "interests": jl(r["interests"]), "tz": r["tz"],
-            "looking": bool(r["looking"]), "role": r["role"], "sponsor_id": r["sponsor_id"]}
+            "looking": bool(r["looking"]), "role": r["role"], "sponsor_id": r["sponsor_id"],
+            "title": r["title"] or "", "city": r["city"] or "", "country": r["country"] or "",
+            "experience": r["experience"] or "", "hours": r["hours"] or 0, "collab": r["collab"] or "",
+            "seeking": r["seeking"] or "", "linkedin": r["linkedin"] or ""}
+
+
+def linkedin_url(b, current=""):
+    if "linkedin" not in b:
+        return current or ""
+    v = text(b, "linkedin", max_len=200)
+    if v and not re.match(r"^https://([a-z]{2,3}\.)?(www\.)?linkedin\.com/(in|company)/[A-Za-z0-9_%-]+/?$", v):
+        raise ApiError(400, "LinkedIn must look like https://www.linkedin.com/in/your-name")
+    return v
+
+
+def luma_link(b):
+    v = url_field(b, "luma_url")
+    host = (urlparse(v).hostname or "").lower()
+    if v and (not v.lower().startswith("https://") or host not in ("luma.com", "lu.ma", "www.luma.com")):
+        raise ApiError(400, "Luma link must be an https://luma.com/… or https://lu.ma/… event page")
+    return v
+
+
+def profile_fields(b, current=None):
+    """Optional builder-profile fields; each must be one of the known values (or blank)."""
+    cur = current or {}
+    def pick(key, options):
+        v = text(b, key, max_len=40) if key in b else (cur[key] if key in cur.keys() else "") or ""
+        if v and v not in options:
+            raise ApiError(400, f"{key} must be one of: {', '.join(options)}")
+        return v
+    hours = int_field(b, "hours", (cur["hours"] if "hours" in cur.keys() else 0) or 0, 0, 80)
+    return (text(b, "title", max_len=60) if "title" in b else (cur["title"] if "title" in cur.keys() else "") or "",
+            text(b, "city", max_len=60) if "city" in b else (cur["city"] if "city" in cur.keys() else "") or "",
+            text(b, "country", max_len=60) if "country" in b else (cur["country"] if "country" in cur.keys() else "") or "",
+            pick("experience", EXPERIENCE), hours, pick("collab", COLLAB), pick("seeking", SEEKING))
 
 
 def status_of(starts_at, ends_at, t):
@@ -322,7 +417,11 @@ def challenge_out(r, t=None):
             "max_team": r["max_team"], "starts_at": r["starts_at"], "ends_at": r["ends_at"],
             "status": status_of(r["starts_at"], r["ends_at"], t), "sponsor": sponsor,
             "team_count": r["team_count"], "hacker_count": r["hacker_count"],
-            "submission_count": r["submission_count"]}
+            "submission_count": r["submission_count"], "format": r["format"] or "Online",
+            "location": r["location"] or "Worldwide", "luma_url": r["luma_url"] or "", "luma_status": r["luma_status"] or "",
+            "time_label": r["time_label"] or "", "venue": r["venue"] or "", "info": r["info"] or "",
+            "food": jl(r["food"]), "video_url": r["video_url"] or "", "is_real": bool(r["is_real"]),
+            "verified_at": r["verified_at"] or ""}
 
 
 def get_challenge(db, cid):
@@ -347,6 +446,7 @@ def team_members(db, team_id):
 def team_out(db, r, t=None):
     members = team_members(db, r["id"])
     return {"id": r["id"], "challenge_id": r["challenge_id"], "challenge_title": r["challenge_title"],
+            "challenge_tags": jl(r["challenge_tags"]),
             "challenge_status": status_of(r["c_starts"], r["c_ends"], t or now()),
             "challenge_starts_at": r["c_starts"], "challenge_ends_at": r["c_ends"],
             "name": r["name"], "idea": r["idea"], "looking_for": jl(r["looking_for"]),
@@ -475,6 +575,8 @@ def signup(c):
         (handle, name, text(b, "bio", max_len=280), json.dumps(clean_list(b.get("skills"))),
          json.dumps(clean_list(b.get("interests"))), int_field(b, "tz", 0, -12, 14),
          1 if role == "hacker" else 0, role, sponsor_id, now())).lastrowid
+    c.db.execute("UPDATE users SET title=?,city=?,country=?,experience=?,hours=?,collab=?,seeking=? WHERE id=?",
+                 profile_fields(b) + (uid,))
     new_session(c, uid)
     return 201, {"user": user_out(c.db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone())}
 
@@ -525,10 +627,11 @@ def me(c):
 @route("POST", "/api/me")
 def update_me(c):
     u, b = c.me(), c.body
-    c.db.execute("UPDATE users SET name=?,bio=?,skills=?,interests=?,tz=?,looking=? WHERE id=?",
+    c.db.execute("UPDATE users SET name=?,bio=?,skills=?,interests=?,tz=?,looking=?,"
+                 "title=?,city=?,country=?,experience=?,hours=?,collab=?,seeking=?,linkedin=? WHERE id=?",
                  (text(b, "name", True, 60), text(b, "bio", max_len=280), json.dumps(clean_list(b.get("skills"))),
                   json.dumps(clean_list(b.get("interests"))), int_field(b, "tz", u["tz"], -12, 14),
-                  1 if b.get("looking") else 0, u["id"]))
+                  1 if b.get("looking") else 0) + profile_fields(b, u) + (linkedin_url(b, u["linkedin"]), u["id"]))
     return 200, {"user": user_out(c.db.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone())}
 
 
@@ -584,9 +687,41 @@ def challenge_detail(c, cid):
     my_team = team_for_user_in_challenge(c.db, uid, cid) if uid else None
     pending = sorted(pending_team_ids(c.db, uid))
     perks = perks_for(c.db, ch, uid)
-    demos = [d for d in demo_rows(c.db, uid, "WHERE t.challenge_id=?", (cid,)) if d["status"] != "past"]
+    demos = demo_rows(c.db, uid, "WHERE t.challenge_id=?", (cid,))
+    # People: everyone who joined the hackathon or is on one of its teams.
+    on_team = {}
+    for t in teams:
+        for m in t["members"]:
+            on_team[m["id"]] = {"id": t["id"], "name": t["name"]}
+    people = []
+    for r in c.db.execute("SELECT u.* FROM users u WHERE u.id IN (SELECT user_id FROM attendees WHERE challenge_id=?"
+                          " UNION SELECT m.user_id FROM members m JOIN teams t ON t.id=m.team_id WHERE t.challenge_id=?)"
+                          " ORDER BY u.name", (cid, cid)):
+        p = user_out(r)
+        p["team"] = on_team.get(r["id"])
+        people.append(p)
+    sponsors = [dict(r) for r in c.db.execute(
+        "SELECT s.id, s.name, s.color, s.tagline, s.website, hs.tier, hs.offer, hs.details, hs.link FROM hackathon_sponsors hs"
+        " JOIN sponsors s ON s.id=hs.sponsor_id WHERE hs.challenge_id=? ORDER BY hs.sort, s.name", (cid,))]
+    attending = bool(uid and c.db.execute("SELECT 1 FROM attendees WHERE challenge_id=? AND user_id=?", (cid, uid)).fetchone())
     return 200, {"challenge": ch, "teams": teams, "submissions": subs, "my_team_id": my_team,
-                 "pending_team_ids": pending, "perks": perks, "demos": demos}
+                 "pending_team_ids": pending, "perks": perks, "demos": demos, "people": people,
+                 "sponsors": sponsors, "attending": attending or bool(my_team)}
+
+
+@route("POST", r"/api/challenges/(\d+)/attend")
+def attend(c, cid):
+    """Join (or leave) a hackathon's participant list. Team members are always counted as attending."""
+    u = c.me()
+    ch = get_challenge(c.db, int(cid))
+    if u["role"] != "hacker":
+        raise ApiError(403, "Only hacker accounts join hackathons")
+    if ch["ends_at"] <= now():
+        raise ApiError(400, "This hackathon has ended")
+    if c.db.execute("DELETE FROM attendees WHERE challenge_id=? AND user_id=?", (ch["id"], u["id"])).rowcount:
+        return 200, {"attending": False}
+    c.db.execute("INSERT INTO attendees(challenge_id,user_id,created_at) VALUES(?,?,?)", (ch["id"], u["id"], now()))
+    return 200, {"attending": True}
 
 
 @route("POST", r"/api/challenges/(\d+)/click")
@@ -975,11 +1110,15 @@ def create_challenge(c):
     starts = int_field(b, "starts_at", now(), now() - DAY, now() + 365 * DAY)
     ends = int_field(b, "ends_at", starts + 7 * DAY, starts + 3600, starts + 60 * DAY)
     cid = c.db.execute(
-        "INSERT INTO challenges(sponsor_id,title,summary,description,prize,tags,resource_url,max_team,starts_at,ends_at,created_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO challenges(sponsor_id,title,summary,description,prize,tags,resource_url,max_team,starts_at,ends_at,created_at,"
+        "format,location,luma_url,venue,info)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (u["sponsor_id"], text(b, "title", True, 80), text(b, "summary", max_len=160), text(b, "description", max_len=4000),
          text(b, "prize", max_len=120), json.dumps(clean_list(b.get("tags"), 8)), url_field(b, "resource_url"),
-         int_field(b, "max_team", 4, 1, 8), starts, ends, now())).lastrowid
+         int_field(b, "max_team", 4, 1, 8), starts, ends, now(),
+         "In person" if b.get("format") == "In person" else "Online",
+         text(b, "location", max_len=60) or ("Worldwide" if b.get("format") != "In person" else ""),
+         luma_link(b), text(b, "venue", max_len=120), text(b, "info", max_len=4000))).lastrowid
     return 201, {"challenge": challenge_out(get_challenge(c.db, cid))}
 
 
@@ -1225,13 +1364,16 @@ def floor_user(db, r):
 
 @route("GET", "/api/floor")
 def floor(c):
+    """The Floor, optionally scoped to one hackathon (?challenge_id=)."""
     t = now()
     uid = c.user["id"] if c.user else None
+    cid = int(c.q("challenge_id")) if c.q("challenge_id").isdigit() else None
     if uid:
         c.db.execute("UPDATE presence SET last_seen=? WHERE user_id=? AND last_seen>?", (t, uid, t - HERE_WINDOW))
     here = []
+    scope_here, scope_args = ("", ()) if cid is None else (" AND p.challenge_id=?", (cid,))
     for r in c.db.execute("SELECT u.*, p.status AS p_status, p.since AS p_since FROM presence p JOIN users u ON u.id=p.user_id"
-                          " WHERE p.last_seen>? ORDER BY p.since", (t - HERE_WINDOW,)):
+                          " WHERE p.last_seen>?" + scope_here + " ORDER BY p.since", (t - HERE_WINDOW,) + scope_args):
         u = floor_user(c.db, r)
         u.update(status=r["p_status"], since=r["p_since"], helped=helped_count(c.db, r["id"]))
         here.append(u)
@@ -1246,7 +1388,9 @@ def floor(c):
     for r in c.db.execute(
             "SELECT p.*, tm.name AS team_name, (SELECT COUNT(*) FROM highfives h WHERE h.post_id=p.id) AS highfives,"
             " EXISTS(SELECT 1 FROM highfives h WHERE h.post_id=p.id AND h.user_id=?) AS highfived"
-            " FROM posts p LEFT JOIN teams tm ON tm.id=p.team_id ORDER BY p.created_at DESC, p.id DESC LIMIT 60", (uid or -1,)):
+            " FROM posts p LEFT JOIN teams tm ON tm.id=p.team_id"
+            + ("" if cid is None else " WHERE COALESCE(p.challenge_id, tm.challenge_id)=?")
+            + " ORDER BY p.created_at DESC, p.id DESC LIMIT 60", (uid or -1,) + (() if cid is None else (cid,))):
         d = dict(r)
         d["tags"], d["highfived"], d["author"] = jl(r["tags"]), bool(r["highfived"]), author(r["user_id"])
         d["resolved_by"] = author(r["resolved_by"]) if r["resolved_by"] else None
@@ -1262,9 +1406,11 @@ def checkin(c):
     t = now()
     status = text(c.body, "status", max_len=120)
     fresh = not c.db.execute("SELECT 1 FROM presence WHERE user_id=? AND last_seen>?", (u["id"], t - HERE_WINDOW)).fetchone()
-    c.db.execute("INSERT INTO presence(user_id,status,since,last_seen) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET"
-                 " status=excluded.status, last_seen=excluded.last_seen" + (", since=excluded.since" if fresh else ""),
-                 (u["id"], status, t, t))
+    cid = c.body.get("challenge_id")
+    cid = get_challenge(c.db, int_field(c.body, "challenge_id", 0, 1, 10 ** 9))["id"] if cid else None
+    c.db.execute("INSERT INTO presence(user_id,status,since,last_seen,challenge_id) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET"
+                 " status=excluded.status, last_seen=excluded.last_seen, challenge_id=excluded.challenge_id"
+                 + (", since=excluded.since" if fresh else ""), (u["id"], status, t, t, cid))
     return 200, {"ok": True}
 
 
@@ -1283,8 +1429,9 @@ def create_post(c):
     body = text(b, "text", True, 500)
     tags = clean_list(b.get("tags"), 5)
     team = current_team(c.db, u["id"])
-    pid = c.db.execute("INSERT INTO posts(user_id,kind,text,tags,team_id,created_at) VALUES(?,?,?,?,?,?)",
-                       (u["id"], kind, body, json.dumps(tags), team["id"] if team else None, now())).lastrowid
+    cid = get_challenge(c.db, int_field(b, "challenge_id", 0, 1, 10 ** 9))["id"] if b.get("challenge_id") else None
+    pid = c.db.execute("INSERT INTO posts(user_id,kind,text,tags,team_id,challenge_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                       (u["id"], kind, body, json.dumps(tags), team["id"] if team else None, cid, now())).lastrowid
     if kind == "help":
         # Tap the right shoulders: people on the floor with a matching skill, and sponsors whose live challenges match.
         want, t = lower_set(tags), now()
@@ -1397,7 +1544,14 @@ def team_room(c, tid):
         d["user"] = {"id": who["id"], "name": who["name"], "handle": who["handle"]}
         log.append(d)
     by = names.get(r["preview_by"])
+    row = c.db.execute("SELECT steps FROM onboarding WHERE team_id=? AND user_id=?", (r["id"], u["id"])).fetchone()
+    steps = set(json.loads(row["steps"])) if row else set()
+    if any(m["id"] == u["id"] and m["doing"] for m in members):
+        steps.add("status")
+    head = ensure_build(c.db, r)
     return 200, {"team": team_out(c.db, r), "members": members, "log": log, "transcript": transcript_lines(c.db, r["id"]),
+                 "onboarding": sorted(steps), "build": {"version": head["id"], "note": head["note"], "at": head["created_at"]} if head else None,
+                 "submission": dict(sub) if (sub := c.db.execute("SELECT title, description FROM submissions WHERE team_id=?", (r["id"],)).fetchone()) else None,
                  "preview": {"url": r["preview_url"] or "", "at": r["preview_at"], "by": by["handle"] if by else None}}
 
 
@@ -2184,6 +2338,535 @@ def stage_answered(c, tid, qid):
     return 200, {"answered": not q["answered"]}
 
 
+# --- Build lab: the team's shared mini project + a coding agent ---
+#
+# Each team has three files (index.html / styles.css / app.js) stored as versioned snapshots. Teammates edit them by
+# hand or ask the agent. The agent never writes files itself: it returns a proposal that a teammate applies or discards.
+# With the Anthropic SDK installed and credentials configured it calls Claude; otherwise it falls back to a few
+# built-in templates and says so.
+
+BUILD_FILES = ("index.html", "styles.css", "app.js")
+BUILD_MAX_FILE = 60_000
+AGENT_MODEL = "claude-opus-5-5"
+AGENT_HOURLY_LIMIT = 20
+AGENT_SYSTEM = """You are the build agent inside a hackathon team's workspace. The team is building a small static web \
+prototype made of exactly three files: index.html, styles.css and app.js. index.html links them with \
+<link rel="stylesheet" href="styles.css"> and <script src="app.js"></script>.
+
+The preview runs in a sandboxed iframe: scripts run, but there is no backend, no cookies or storage you can rely on, \
+and network requests may fail. Keep the prototype self-contained (no build step, no frameworks, no CDN imports) and \
+use realistic sample data where the idea needs data.
+
+Make the change the teammate asks for, building on the current files rather than starting over unless they ask you \
+to. Write accessible, responsive markup. Return every file you change with its complete new contents, and leave \
+unchanged files out. In the summary, tell the team in two or three sentences what you changed and anything they \
+should check."""
+AGENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "files": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "enum": list(BUILD_FILES)}, "content": {"type": "string"}},
+            "required": ["path", "content"], "additionalProperties": False}},
+    },
+    "required": ["summary", "files"], "additionalProperties": False,
+}
+
+
+def agent_mode():
+    """'claude' when the SDK is importable and credentials are configured, else 'simulated'. AOH_AGENT overrides."""
+    forced = os.environ.get("AOH_AGENT", "").lower()
+    if forced in ("claude", "simulated"):
+        return forced
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:
+        return "simulated"
+    has_creds = any(os.environ.get(k) for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"))
+    return "claude" if has_creds else "simulated"
+
+
+def starter_files(name, idea):
+    title = name.replace("<", "").replace(">", "")
+    pitch = (idea or "A prototype we're building together.").replace("<", "").replace(">", "")
+    return {
+        "index.html": f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="hero">
+    <span class="kicker">Prototype · v0</span>
+    <h1>{title}</h1>
+    <p>{pitch}</p>
+    <button id="cta">Try it</button>
+    <p id="out" role="status"></p>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
+""",
+        "styles.css": """body { margin: 0; font-family: system-ui, sans-serif; background: #f8faff; color: #18213d; }
+.hero { max-width: 640px; margin: 12vh auto; padding: 0 24px; }
+.kicker { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: #6750eb; }
+h1 { font-size: clamp(36px, 6vw, 56px); letter-spacing: -.03em; margin: 12px 0; }
+p { color: #626e87; line-height: 1.7; }
+button { font: inherit; font-weight: 600; color: #fff; border: 0; border-radius: 10px; padding: 12px 18px;
+  background: linear-gradient(120deg, #2f65f4, #6750eb); cursor: pointer; }
+button:focus-visible { outline: 3px solid #9b85ff; outline-offset: 3px; }
+""",
+        "app.js": """document.getElementById('cta').addEventListener('click', () => {
+  document.getElementById('out').textContent = 'It works! Ask the build agent for the next step.';
+});
+""",
+    }
+
+
+def build_head(db, team_id):
+    return db.execute("SELECT * FROM build_versions WHERE team_id=? ORDER BY id DESC LIMIT 1", (team_id,)).fetchone()
+
+
+def ensure_build(db, team):
+    head = build_head(db, team["id"])
+    if head:
+        return head
+    db.execute("INSERT INTO build_versions(team_id,note,files,user_id,created_at) VALUES(?,?,?,?,?)",
+               (team["id"], "Starter files", json.dumps(starter_files(team["name"], team["idea"])), None, now()))
+    return build_head(db, team["id"])
+
+
+def clean_files(raw, partial=False):
+    """Validate a {path: content} map from a client or the agent."""
+    if not isinstance(raw, dict):
+        raise ApiError(400, "files must be an object of path → content")
+    out = {}
+    for path, content in raw.items():
+        if path not in BUILD_FILES:
+            raise ApiError(400, f"Unknown file {path!r} — the project has {', '.join(BUILD_FILES)}")
+        if not isinstance(content, str) or len(content) > BUILD_MAX_FILE:
+            raise ApiError(400, f"{path} must be text under {BUILD_MAX_FILE // 1000} KB")
+        out[path] = content
+    if not partial and set(out) != set(BUILD_FILES):
+        raise ApiError(400, "Send all three files")
+    return out
+
+
+def save_version(db, team_id, files, note, uid):
+    db.execute("INSERT INTO build_versions(team_id,note,files,user_id,created_at) VALUES(?,?,?,?,?)",
+               (team_id, note[:200], json.dumps(files), uid, now()))
+    # Keep the 40 most recent versions per team.
+    db.execute("DELETE FROM build_versions WHERE team_id=? AND id NOT IN"
+               " (SELECT id FROM build_versions WHERE team_id=? ORDER BY id DESC LIMIT 40)", (team_id, team_id))
+    return build_head(db, team_id)
+
+
+def run_out(db, r):
+    who = db.execute("SELECT handle, name FROM users WHERE id=?", (r["user_id"],)).fetchone()
+    return {"id": r["id"], "prompt": r["prompt"], "status": r["status"], "mode": r["mode"], "summary": r["summary"],
+            "files": json.loads(r["files"]) if r["files"] else None, "error": r["error"], "base_version": r["base_version"],
+            "created_at": r["created_at"], "finished_at": r["finished_at"],
+            "user": {"id": r["user_id"], "handle": who["handle"], "name": who["name"]} if who else None}
+
+
+@route("GET", r"/api/teams/(\d+)/build")
+def build_state(c, tid):
+    u, r = require_member(c, tid)
+    head = ensure_build(c.db, r)
+    names = {x["id"]: x["handle"] for x in c.db.execute("SELECT id, handle FROM users")}
+    versions = [{"id": v["id"], "note": v["note"], "by": names.get(v["user_id"]), "created_at": v["created_at"]}
+                for v in c.db.execute("SELECT id, note, user_id, created_at FROM build_versions WHERE team_id=?"
+                                      " ORDER BY id DESC LIMIT 15", (r["id"],))]
+    runs = [run_out(c.db, x) for x in c.db.execute(
+        "SELECT * FROM (SELECT * FROM agent_runs WHERE team_id=? ORDER BY id DESC LIMIT 20) ORDER BY id", (r["id"],))]
+    mode = agent_mode() if c.srv.agent_mode is None else c.srv.agent_mode
+    return 200, {"files": json.loads(head["files"]), "version": head["id"], "versions": versions, "runs": runs,
+                 "agent": {"mode": mode, "model": AGENT_MODEL if mode == "claude" else None},
+                 "running": any(x["status"] == "running" for x in runs)}
+
+
+@route("POST", r"/api/teams/(\d+)/build/files")
+def build_save(c, tid):
+    u, r = require_member(c, tid)
+    head = ensure_build(c.db, r)
+    files = dict(json.loads(head["files"]), **clean_files(c.body.get("files"), partial=True))
+    v = save_version(c.db, r["id"], files, text(c.body, "note", max_len=200) or "Edited by hand", u["id"])
+    return 201, {"version": v["id"]}
+
+
+@route("POST", r"/api/teams/(\d+)/build/restore")
+def build_restore(c, tid):
+    u, r = require_member(c, tid)
+    old = c.db.execute("SELECT * FROM build_versions WHERE id=? AND team_id=?",
+                       (int_field(c.body, "version_id", 0, 1, 10 ** 9), r["id"])).fetchone()
+    if not old:
+        raise ApiError(404, "Version not found")
+    v = save_version(c.db, r["id"], json.loads(old["files"]), f"Restored v{old['id']} ({old['note']})", u["id"])
+    log_team(c.db, r["id"], u["id"], f"restored the build lab project to v{old['id']}")
+    return 201, {"version": v["id"]}
+
+
+@route("POST", r"/api/teams/(\d+)/agent")
+def agent_start(c, tid):
+    u, r = require_member(c, tid)
+    prompt = text(c.body, "prompt", True, 2000)
+    head = ensure_build(c.db, r)
+    if c.db.execute("SELECT 1 FROM agent_runs WHERE team_id=? AND status='running'", (r["id"],)).fetchone():
+        raise ApiError(409, "The agent is already working on a task for your team — wait for it to finish")
+    if c.db.execute("SELECT COUNT(*) FROM agent_runs WHERE user_id=? AND created_at>?",
+                    (u["id"], now() - 3600)).fetchone()[0] >= AGENT_HOURLY_LIMIT:
+        raise ApiError(429, f"That's {AGENT_HOURLY_LIMIT} agent tasks this hour — take a breather")
+    mode = agent_mode() if c.srv.agent_mode is None else c.srv.agent_mode
+    rid = c.db.execute("INSERT INTO agent_runs(team_id,user_id,prompt,status,mode,base_version,created_at)"
+                       " VALUES(?,?,?,?,?,?,?)", (r["id"], u["id"], prompt, "running", mode, head["id"], now())).lastrowid
+    context = {"team": r["name"], "idea": r["idea"], "challenge": r["challenge_title"],
+               "looking_for": jl(r["looking_for"])}
+    sub = c.db.execute("SELECT title, description FROM submissions WHERE team_id=?", (r["id"],)).fetchone()
+    if sub:
+        context["submission"] = {"title": sub["title"], "description": sub["description"]}
+    history = [{"prompt": x["prompt"], "summary": x["summary"], "status": x["status"]} for x in c.db.execute(
+        "SELECT prompt, summary, status FROM agent_runs WHERE team_id=? AND id<? AND status IN ('applied','discarded')"
+        " ORDER BY id DESC LIMIT 4", (r["id"], rid))][::-1]
+    job = (c.srv.db_path, rid, mode, prompt, json.loads(head["files"]), context, history, c.srv.agent_delay)
+    c.after_commit.append(lambda: threading.Thread(target=run_agent, args=job, daemon=True).start())
+    log_team(c.db, r["id"], u["id"], f"asked the build agent: {prompt[:80]}")
+    return 201, {"run": run_out(c.db, c.db.execute("SELECT * FROM agent_runs WHERE id=?", (rid,)).fetchone())}
+
+
+def run_agent(db_path, rid, mode, prompt, files, context, history, delay):
+    """Background worker: produce a proposal, then record it (or the failure) on the run."""
+    status, summary, proposal, error = "ready", "", None, ""
+    try:
+        if mode == "claude":
+            summary, proposal = call_claude(prompt, files, context, history)
+        else:
+            time.sleep(delay)  # lets the UI show its working state; the templates themselves are instant
+            summary, proposal = simulated_agent(prompt, files, context)
+        if not proposal:
+            status, error = "failed", summary or "The agent didn't propose any file changes."
+    except AgentError as e:
+        status, error = "failed", str(e)
+    except Exception:
+        traceback.print_exc()
+        status, error = "failed", "The agent hit an unexpected error. Try again in a moment."
+    db = connect(db_path)
+    try:
+        db.execute("UPDATE agent_runs SET status=?, summary=?, files=?, error=?, finished_at=? WHERE id=?",
+                   (status, summary, json.dumps(proposal) if proposal else None, error, now(), rid))
+        db.commit()
+    finally:
+        db.close()
+
+
+class AgentError(Exception):
+    """A failure we can explain to the team."""
+
+
+def call_claude(prompt, files, context, history):
+    import anthropic
+
+    client = anthropic.Anthropic()
+    project = "\n\n".join(f'<file path="{p}">\n{files[p]}\n</file>' for p in BUILD_FILES)
+    past = "\n".join(f"- {h['prompt']} → {h['status']}: {h['summary']}" for h in history) or "- (none yet)"
+    content = (f"<team_context>\n{json.dumps(context, indent=2)}\n</team_context>\n\n"
+               f"<earlier_tasks>\n{past}\n</earlier_tasks>\n\n<current_files>\n{project}\n</current_files>\n\n"
+               f"<task>\n{prompt}\n</task>")
+    try:
+        with client.beta.messages.stream(
+            model=AGENT_MODEL,
+            max_tokens=64000,
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",  # on a safety decline, retry on Anthropic's recommended fallback model
+            cache_control={"type": "ephemeral"},
+            system=AGENT_SYSTEM,
+            output_config={"effort": "high", "format": {"type": "json_schema", "schema": AGENT_SCHEMA}},
+            messages=[{"role": "user", "content": content}],
+        ) as stream:
+            message = stream.get_final_message()
+    except anthropic.AuthenticationError:
+        raise AgentError("The server's Anthropic credentials were rejected — ask whoever runs this server to check them.")
+    except anthropic.RateLimitError:
+        raise AgentError("The agent is rate-limited right now. Try again in a minute.")
+    except anthropic.APIStatusError as e:
+        raise AgentError(f"The Claude API returned an error ({e.status_code}). Try again shortly.")
+    except anthropic.APIConnectionError:
+        raise AgentError("Couldn't reach the Claude API from the server.")
+    if message.stop_reason == "refusal":
+        raise AgentError("Claude declined this task. Try rephrasing what you'd like built.")
+    if message.stop_reason == "max_tokens":
+        raise AgentError("The change was too large to finish in one go. Ask for a smaller step.")
+    raw = next((b.text for b in message.content if b.type == "text"), "")
+    try:
+        data = json.loads(raw)
+        changed = clean_files({f["path"]: f["content"] for f in data["files"]}, partial=True)
+        return str(data["summary"])[:2000], changed
+    except (ValueError, KeyError, TypeError, ApiError):
+        raise AgentError("The agent's reply couldn't be read as file changes. Try again.")
+
+
+def simulated_agent(prompt, files, context):
+    """No model available: pick the closest built-in recipe and apply it to the team's real context."""
+    p = prompt.lower()
+    name, idea = context["team"], context.get("idea") or "Our hackathon prototype."
+    esc = lambda s: s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    note = " (Simulated agent: no Claude API key is configured on this server, so this is a built-in template.)"
+    if re.search(r"access|a11y|keyboard|contrast|screen reader", p):
+        css = files["styles.css"].rstrip() + """
+
+/* Accessibility pass */
+:focus-visible { outline: 3px solid #6750eb; outline-offset: 3px; }
+.skip { position: absolute; left: -999px; top: 8px; background: #fff; padding: 8px 12px; border-radius: 8px; }
+.skip:focus { left: 8px; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+"""
+        html = files["index.html"]
+        if 'class="skip"' not in html:
+            html = re.sub(r"<body([^>]*)>", r'<body\1>\n  <a class="skip" href="#main">Skip to content</a>', html, count=1)
+            html = re.sub(r"<main(?![^>]*\bid=)", '<main id="main"', html, count=1)
+        return ("Added a skip link, visible keyboard focus and a reduced-motion rule, and gave the main region an id "
+                "for the skip link. Tab through the preview to check the focus order." + note,
+                {"index.html": html, "styles.css": css})
+    if re.search(r"dashboard|progress|metric|stats|chart", p):
+        html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{esc(name)} · progress</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="dash">
+    <span class="kicker">Team dashboard · sample data</span>
+    <h1>{esc(name)}</h1>
+    <p>{esc(idea)}</p>
+    <section class="cards" aria-label="Progress">
+      <div class="card"><strong id="pct">0%</strong><span>milestone done</span></div>
+      <div class="card"><strong id="open">0</strong><span>open tasks</span></div>
+      <div class="card"><strong id="done">0</strong><span>shipped</span></div>
+    </section>
+    <div class="bar" aria-hidden="true"><span id="fill"></span></div>
+    <ul id="tasks" class="tasks"></ul>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
+"""
+        css = """body { margin: 0; font-family: system-ui, sans-serif; background: #f8faff; color: #18213d; }
+.dash { max-width: 760px; margin: 8vh auto; padding: 0 24px; }
+.kicker { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: #6750eb; }
+h1 { font-size: clamp(32px, 5vw, 48px); letter-spacing: -.03em; margin: 10px 0; }
+p { color: #626e87; }
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 24px 0; }
+.card { background: #fff; border: 1px solid #e1e6f1; border-radius: 14px; padding: 16px; }
+.card strong { display: block; font-size: 28px; color: #2f65f4; }
+.card span { color: #626e87; font-size: 13px; }
+.bar { height: 8px; border-radius: 8px; background: #e7e9f6; overflow: hidden; }
+#fill { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #2f65f4, #8652e9); transition: width .4s; }
+.tasks { list-style: none; padding: 0; margin: 20px 0; display: grid; gap: 8px; }
+.tasks label { display: flex; gap: 10px; align-items: center; background: #fff; border: 1px solid #e1e6f1; border-radius: 10px; padding: 12px 14px; cursor: pointer; }
+.tasks input { width: 18px; height: 18px; accent-color: #6750eb; }
+@media (max-width: 560px) { .cards { grid-template-columns: 1fr; } }
+"""
+        js = """const tasks = [
+  { title: 'Sketch the core user journey', done: true },
+  { title: 'Build the first working screen', done: true },
+  { title: 'Connect sample data', done: false },
+  { title: 'Test with three people', done: false },
+  { title: 'Record the demo', done: false },
+];
+
+function render() {
+  const list = document.getElementById('tasks');
+  list.innerHTML = '';
+  tasks.forEach((t, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<label><input type="checkbox" ${t.done ? 'checked' : ''}> <span></span></label>`;
+    li.querySelector('span').textContent = t.title;
+    li.querySelector('input').addEventListener('change', (e) => { tasks[i].done = e.target.checked; render(); });
+    list.append(li);
+  });
+  const done = tasks.filter((t) => t.done).length;
+  document.getElementById('pct').textContent = Math.round((done / tasks.length) * 100) + '%';
+  document.getElementById('open').textContent = tasks.length - done;
+  document.getElementById('done').textContent = done;
+  document.getElementById('fill').style.width = (done / tasks.length) * 100 + '%';
+}
+render();
+"""
+        return ("Turned the page into a progress dashboard with sample tasks: tick a task and the metrics and "
+                "progress bar update. Swap the sample tasks in app.js for your real ones." + note,
+                {"index.html": html, "styles.css": css, "app.js": js})
+    features = ["Start in seconds", "Built with real users", "Works on any device"]
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{esc(name)}</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="nav"><strong>{esc(name)}</strong><a href="#signup">Get early access</a></header>
+  <main>
+    <section class="hero">
+      <span class="kicker">Built at the Always-On Hackathon</span>
+      <h1>{esc(name)}</h1>
+      <p>{esc(idea)}</p>
+      <form id="signup" class="signup">
+        <label for="email" class="sr">Email</label>
+        <input id="email" type="email" required placeholder="you@example.com">
+        <button>Join the waitlist</button>
+      </form>
+      <p id="thanks" role="status"></p>
+    </section>
+    <section class="features" aria-label="Why it matters">
+      {''.join(f'<article><h2>{f}</h2><p>Replace this with what makes {esc(name)} different.</p></article>' for f in features)}
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
+"""
+    css = """body { margin: 0; font-family: system-ui, sans-serif; background: radial-gradient(ellipse at 90% 0%, #ece8ff, #f8faff 45%); color: #18213d; }
+.nav { display: flex; justify-content: space-between; align-items: center; max-width: 960px; margin: 0 auto; padding: 20px 24px; }
+.nav a { color: #2f65f4; font-weight: 600; text-decoration: none; }
+.hero { max-width: 960px; margin: 6vh auto; padding: 0 24px; }
+.kicker { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: #6750eb; }
+h1 { font-size: clamp(40px, 7vw, 72px); letter-spacing: -.04em; margin: 12px 0; background: linear-gradient(100deg, #275ef5, #8652e9 65%, #c75bc6); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hero p { max-width: 560px; color: #626e87; line-height: 1.7; font-size: 18px; }
+.signup { display: flex; gap: 8px; margin-top: 24px; flex-wrap: wrap; }
+.signup input { flex: 1; min-width: 200px; font: inherit; padding: 12px 14px; border: 1px solid #dce4f3; border-radius: 10px; }
+.signup button { font: inherit; font-weight: 600; color: #fff; border: 0; border-radius: 10px; padding: 12px 18px; background: linear-gradient(120deg, #2f65f4, #6750eb); cursor: pointer; }
+.features { max-width: 960px; margin: 0 auto 10vh; padding: 0 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+.features article { background: #fff; border: 1px solid #e1e6f1; border-radius: 14px; padding: 20px; }
+.features h2 { font-size: 17px; margin: 0 0 6px; }
+.features p { color: #626e87; margin: 0; }
+.sr { position: absolute; left: -999px; }
+:focus-visible { outline: 3px solid #9b85ff; outline-offset: 3px; }
+"""
+    js = """document.getElementById('signup').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const email = document.getElementById('email').value;
+  document.getElementById('thanks').textContent = `Thanks! We'll write to ${email} when it's ready (demo only — nothing is sent).`;
+  e.target.reset();
+});
+"""
+    return ("Built a landing page from your team's idea: headline, waitlist form (demo only) and three feature "
+            "cards to fill in." + note, {"index.html": html, "styles.css": css, "app.js": js})
+
+
+def agent_run_row(c, tid, rid):
+    u, r = require_member(c, tid)
+    run = c.db.execute("SELECT * FROM agent_runs WHERE id=? AND team_id=?", (int(rid), r["id"])).fetchone()
+    if not run:
+        raise ApiError(404, "Agent task not found")
+    if run["status"] != "ready":
+        raise ApiError(409, "This proposal was already handled")
+    return u, r, run
+
+
+@route("POST", r"/api/teams/(\d+)/agent/(\d+)/apply")
+def agent_apply(c, tid, rid):
+    u, r, run = agent_run_row(c, tid, rid)
+    head = ensure_build(c.db, r)
+    if head["id"] != run["base_version"] and not c.body.get("force"):
+        raise ApiError(409, "The files changed since the agent started — applying would overwrite those edits")
+    files = dict(json.loads(head["files"]), **json.loads(run["files"]))
+    v = save_version(c.db, r["id"], files, f"Agent: {run['prompt'][:120]}", u["id"])
+    c.db.execute("UPDATE agent_runs SET status='applied' WHERE id=?", (run["id"],))
+    log_team(c.db, r["id"], u["id"], f"applied the build agent's change (v{v['id']})")
+    return 200, {"version": v["id"]}
+
+
+@route("POST", r"/api/teams/(\d+)/agent/(\d+)/discard")
+def agent_discard(c, tid, rid):
+    u, r, run = agent_run_row(c, tid, rid)
+    c.db.execute("UPDATE agent_runs SET status='discarded' WHERE id=?", (run["id"],))
+    return 200, {"ok": True}
+
+
+# --- builders directory: saved builders, connections, projects ---
+
+@route("GET", "/api/saved")
+def saved_list(c):
+    u = c.me()
+    return 200, {"saved": [r[0] for r in c.db.execute(
+        "SELECT builder_id FROM saved_builders WHERE user_id=? ORDER BY created_at", (u["id"],))],
+                 "connected": [r[0] for r in c.db.execute(
+        "SELECT other_id FROM connections WHERE user_id=?", (u["id"],))]}
+
+
+def builder_row(c, bid):
+    r = c.db.execute("SELECT * FROM users WHERE id=? AND role='hacker'", (int(bid),)).fetchone()
+    if not r:
+        raise ApiError(404, "Builder not found")
+    return r
+
+
+@route("POST", r"/api/people/(\d+)/save")
+def toggle_save(c, bid):
+    u = c.me()
+    b = builder_row(c, bid)
+    if b["id"] == u["id"]:
+        raise ApiError(400, "That's you")
+    if c.db.execute("DELETE FROM saved_builders WHERE user_id=? AND builder_id=?", (u["id"], b["id"])).rowcount:
+        return 200, {"saved": False}
+    c.db.execute("INSERT INTO saved_builders(user_id,builder_id,created_at) VALUES(?,?,?)", (u["id"], b["id"], now()))
+    return 200, {"saved": True}
+
+
+@route("POST", r"/api/people/(\d+)/connect")
+def connect_builder(c, bid):
+    u = c.me()
+    b = builder_row(c, bid)
+    if b["id"] == u["id"]:
+        raise ApiError(400, "That's you")
+    if c.db.execute("SELECT 1 FROM connections WHERE user_id=? AND other_id=?", (u["id"], b["id"])).fetchone():
+        return 200, {"connected": True, "already": True}
+    c.db.execute("INSERT INTO connections(user_id,other_id,created_at) VALUES(?,?,?)", (u["id"], b["id"], now()))
+    mutual = c.db.execute("SELECT 1 FROM connections WHERE user_id=? AND other_id=?", (b["id"], u["id"])).fetchone()
+    notify(c.db, [b["id"]], f"🤝 @{u['handle']} {'connected back' if mutual else 'wants to connect'} — say hi?", f"#/u/{u['handle']}")
+    return 200, {"connected": True, "mutual": bool(mutual)}
+
+
+@route("GET", "/api/projects")
+def projects(c):
+    out = []
+    for r in c.db.execute(
+            "SELECT s.*, t.name AS team_name, ch.title AS challenge_title, ch.ends_at AS c_ends,"
+            " (SELECT COUNT(*) FROM votes v WHERE v.submission_id=s.id) AS votes"
+            " FROM submissions s JOIN teams t ON t.id=s.team_id JOIN challenges ch ON ch.id=s.challenge_id"
+            " ORDER BY votes DESC, s.created_at DESC"):
+        d = dict(r)
+        d["stack"] = jl(r["stack"])
+        d["members"] = team_members(c.db, r["team_id"])
+        d["stage"] = "Shipped" if r["c_ends"] <= now() else "In progress"
+        out.append(d)
+    return 200, {"projects": out}
+
+
+ONBOARDING_STEPS = ("brief", "catchup", "lab", "status")
+
+
+@route("POST", r"/api/teams/(\d+)/onboarding")
+def set_onboarding(c, tid):
+    u, r = require_member(c, tid)
+    step = c.body.get("step")
+    if step not in ONBOARDING_STEPS:
+        raise ApiError(400, "Unknown onboarding step")
+    row = c.db.execute("SELECT steps FROM onboarding WHERE team_id=? AND user_id=?", (r["id"], u["id"])).fetchone()
+    steps = set(json.loads(row["steps"])) if row else set()
+    (steps.add if c.body.get("done") else steps.discard)(step)
+    c.db.execute("INSERT INTO onboarding(team_id,user_id,steps) VALUES(?,?,?) ON CONFLICT(team_id,user_id) DO UPDATE SET"
+                 " steps=excluded.steps", (r["id"], u["id"], json.dumps(sorted(steps))))
+    return 200, {"steps": sorted(steps)}
+
+
 # ---------- HTTP ----------
 
 class Handler(BaseHTTPRequestHandler):
@@ -2249,7 +2932,7 @@ class Handler(BaseHTTPRequestHandler):
         if "application/json" not in (self.headers.get("Content-Type") or ""):
             raise ApiError(415, "Send application/json")
         length = int(self.headers.get("Content-Length") or 0)
-        if length > 64_000:
+        if length > 256_000:  # room for three project files at 60 KB each
             raise ApiError(413, "Request too large")
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
@@ -2296,6 +2979,8 @@ def make_server(db_path, host="127.0.0.1", port=8000, quiet=False, auto_approve=
     srv.db_path, srv.quiet = db_path, quiet
     srv.auto_approve = auto_approve  # seconds before join requests approve themselves; 0 = owners decide
     srv.react_times = {}
+    srv.agent_mode = None   # None = detect (Claude when the SDK + credentials exist); tests pin "simulated"
+    srv.agent_delay = 1.5   # simulated agent's pause, so its working state is visible
     srv.demo_ritual = None
     if live_ritual:
         # Demo mode: run one ritual right now. The ceremony starts just before its demos so the stage goes live in a minute.
@@ -2324,6 +3009,12 @@ def main():
         import seed
         seed.seed(args.db)
         print("Seeded demo data.")
+    if not args.no_seed:
+        import seed
+        if seed.seed_builders(args.db):
+            print("Added the builders-directory demo data.")
+        if seed.seed_hackathons(args.db):
+            print("Added hackathon pages: AI Engineer NY (Luma), partner sponsors, info and food.")
     if srv.demo_ritual and not args.no_seed:
         import seed
         o = make_occ(srv.demo_ritual["key"], srv.demo_ritual["starts_at"])
