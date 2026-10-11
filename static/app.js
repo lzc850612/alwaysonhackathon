@@ -1,0 +1,1110 @@
+'use strict';
+
+const app = document.getElementById('app');
+const nav = document.getElementById('nav');
+let me = null;
+let renderSeq = 0;
+
+// ---------- utilities ----------
+
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+async function api(path, body) {
+  const opts = { credentials: 'same-origin', headers: {} };
+  if (body !== undefined) {
+    opts.method = 'POST';
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch('/api' + path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error || `Request failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+let toastTimer;
+function toast(msg, isErr = false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show' + (isErr ? ' err' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = isErr ? 'err' : ''; }, 2800);
+}
+
+// Server time, so every countdown on every screen shows the same seconds (live.js sets the skew).
+let clockSkew = 0;
+const nowSec = () => Date.now() / 1000 + clockSkew;
+
+const pad = (n) => String(n).padStart(2, '0');
+function until(ts) {
+  let s = Math.floor(ts - nowSec());
+  if (s <= 0) return 'now';
+  const d = Math.floor(s / 86400); s %= 86400;
+  const h = Math.floor(s / 3600); s %= 3600;
+  const m = Math.floor(s / 60);
+  return d ? `${d}d ${h}h ${m}m` : `${pad(h)}:${pad(m)}:${pad(s % 60)}`;
+}
+setInterval(() => {
+  document.querySelectorAll('[data-until]').forEach((el) => { el.textContent = until(+el.dataset.until); });
+}, 1000);
+
+const ago = (ts) => {
+  const m = Math.max(0, Math.round((nowSec() - ts) / 60));
+  return m < 1 ? 'just now' : m < 60 ? `${m}m ago` : m < 1440 ? `${Math.round(m / 60)}h ago` : fmtDate(ts);
+};
+const fmtDate = (ts) => new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+const tzLabel = (tz) => `UTC${tz >= 0 ? '+' : ''}${tz}`;
+const browserTz = () => Math.round(-new Date().getTimezoneOffset() / 60);
+const splitList = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
+
+function timing(c) {
+  if (c.status === 'past') return `ended ${fmtDate(c.ends_at)}`;
+  const target = c.status === 'upcoming' ? c.starts_at : c.ends_at;
+  return `${c.status === 'upcoming' ? 'starts in' : 'ends in'} <span class="countdown" data-until="${target}">${until(target)}</span>`;
+}
+
+function hue(s) {
+  let h = 0;
+  for (const ch of s) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  return h;
+}
+function avatar(u, cls = '') {
+  const ini = u.name.split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
+  return `<span class="avatar ${cls}" style="--h:${hue(u.handle)}" title="${esc(u.name)}">${esc(ini)}</span>`;
+}
+function chips(list, cls = '', hits = []) {
+  const h = new Set(hits.map((x) => x.toLowerCase()));
+  return `<div class="chips">${list.map((x) =>
+    `<span class="chip ${cls} ${h.has(x.toLowerCase()) ? 'hit' : ''}">${esc(x)}</span>`).join('')}</div>`;
+}
+const pill = (s) => `<span class="pill ${s}">${{ live: 'Live', upcoming: 'Soon', past: 'Ended' }[s]}</span>`;
+const scoreRing = (n) => `<div class="score" style="--p:${n}" title="Match score"><span>${n}</span></div>`;
+const reasons = (rs) => rs && rs.length ? `<ul class="reasons">${rs.map((r) => `<li>${esc(r)}</li>`).join('')}</ul>` : '';
+const empty = (html) => `<div class="empty">${html}</div>`;
+const tzOptions = (sel) => Array.from({ length: 27 }, (_, i) => i - 12)
+  .map((t) => `<option value="${t}" ${t === sel ? 'selected' : ''}>${tzLabel(t)}</option>`).join('');
+
+function formValues(form) {
+  const out = Object.fromEntries(new FormData(form));
+  form.querySelectorAll('input[type=checkbox]').forEach((cb) => { out[cb.name] = cb.checked; });
+  return out;
+}
+
+function onSubmit(selector, handler) {
+  const form = app.querySelector(selector);
+  if (!form) return;
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = form.querySelector('button[type=submit], button:not([type])');
+    if (btn) btn.disabled = true;
+    try { await handler(formValues(form), form); } catch (err) { toast(err.message, true); } finally { if (btn) btn.disabled = false; }
+  });
+}
+
+function modal(title, bodyHtml, okLabel, onOk) {
+  const d = document.createElement('dialog');
+  d.innerHTML = `<form class="stack"><h2>${esc(title)}</h2>${bodyHtml}
+    <div class="row" style="justify-content:flex-end"><button type="button" class="btn ghost" data-close>Cancel</button>
+    <button type="submit" class="btn">${esc(okLabel)}</button></div></form>`;
+  document.body.append(d);
+  const form = d.querySelector('form');
+  d.querySelector('[data-close]').onclick = () => d.close();
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    try { await onOk(formValues(form)); d.close(); } catch (err) { toast(err.message, true); }
+  };
+  d.addEventListener('close', () => d.remove());
+  d.showModal();
+}
+
+async function refreshMe() {
+  const before = `${me?.id}:${me?.tz}:${(me?.teams || []).map((t) => t.id)}`;
+  me = (await api('/me')).user;
+  renderNav();
+  // The clock bar's region and deadline are per person: refresh it when who you are, your timezone or your teams change.
+  if (`${me?.id}:${me?.tz}:${(me?.teams || []).map((t) => t.id)}` !== before) refreshClock();
+}
+
+// ---------- shared components ----------
+
+function challengeCard(c) {
+  return `<a class="card challenge-card" href="#/c/${c.id}" style="--c:${esc(c.sponsor.color)}">
+    <div class="row spread"><span class="sponsor">${esc(c.sponsor.name)}</span>${pill(c.status)}</div>
+    <h3>${esc(c.title)}</h3>
+    <p class="muted small" style="margin:0">${esc(c.summary)}</p>
+    ${c.prize ? `<div class="prize">${esc(c.prize)}</div>` : ''}
+    ${chips(c.tags)}
+    <div class="meta"><span>${c.team_count} teams · ${c.hacker_count} hackers</span><span>${timing(c)}</span></div>
+  </a>`;
+}
+
+function joinAction(t, ctx = {}) {
+  if (!me) return `<a class="btn sm" href="#/join">Sign in to join</a>`;
+  if (me.role !== 'hacker') return '';
+  if (t.members.some((m) => m.id === me.id)) return `<a class="btn sm ghost" href="#/t/${t.id}">Your team →</a>`;
+  if (ctx.myTeamId) return '';
+  if (t.requested || (ctx.pending || []).includes(t.id)) return `<button class="btn sm ghost" disabled>Requested</button>`;
+  if (!t.open) return `<span class="small muted">Full</span>`;
+  return `<button class="btn sm" data-act="join" data-id="${t.id}" data-name="${esc(t.name)}">Request to join</button>`;
+}
+
+function teamCard(t, opts = {}) {
+  const slots = Math.max(0, t.max_size - t.members.length);
+  return `<div class="card team-card">
+    <div class="row spread" style="align-items:flex-start;flex-wrap:nowrap">
+      <div><a href="#/t/${t.id}"><h3>${esc(t.name)}</h3></a>
+      ${opts.showChallenge ? `<div class="small muted">for <a href="#/c/${t.challenge_id}">${esc(t.challenge_title)}</a></div>` : ''}</div>
+      ${opts.score != null ? scoreRing(opts.score) : ''}
+    </div>
+    ${t.idea ? `<p class="small" style="margin:0">${esc(t.idea)}</p>` : ''}
+    ${t.looking_for.length ? `<div><div class="small muted" style="margin-bottom:4px">Looking for</div>${chips(t.looking_for, 'need', me ? me.skills : [])}</div>` : ''}
+    ${reasons(opts.reasons)}
+    <div class="foot-row">
+      <div class="avatars">${t.members.map((m) => avatar(m)).join('')}${'<span class="slot"></span>'.repeat(slots)}</div>
+      ${opts.action ?? ''}
+    </div>
+  </div>`;
+}
+
+function personCard(p, extra = '') {
+  return `<div class="card person">
+    ${avatar(p, 'lg')}
+    <div class="who">
+      <div class="row spread"><div><a class="name" href="#/u/${esc(p.handle)}">${esc(p.name)}</a>
+        <div class="handle">@${esc(p.handle)} · ${tzLabel(p.tz)}</div></div>
+        ${p.score != null ? scoreRing(p.score) : p.looking ? '<span class="pill live">Looking</span>' : ''}</div>
+      ${p.bio ? `<p class="small" style="margin:8px 0">${esc(p.bio)}</p>` : '<div style="height:8px"></div>'}
+      ${chips(p.skills)}
+      ${reasons(p.reasons)}
+      ${extra}
+    </div>
+  </div>`;
+}
+
+const PERK_LABEL = { credits: '💳 Credits', mentorship: '🧑‍🏫 Mentorship', office_hours: '🕐 Office hours', api_access: '🔑 API access', swag: '🎁 Swag' };
+
+function demoCard(d, opts = {}) {
+  const when = d.status === 'live' ? '<span class="pill live">Live now</span>'
+    : d.status === 'upcoming' ? `<span class="pill upcoming">in <span data-until="${d.starts_at}">${until(d.starts_at)}</span></span>`
+    : '<span class="pill past">Ended</span>';
+  const btn = d.status === 'past' ? ''
+    : `<button class="btn sm ${d.status === 'live' ? '' : 'ghost'}" data-act="watch" data-id="${d.id}">${d.status === 'live' ? 'Join on Zoom ↗' : d.watching ? 'Going ✓ — open link' : "I'll watch"}</button>`;
+  return `<div class="card demo">
+    <div class="row spread">${when}<span class="small muted">${d.watchers} watching</span></div>
+    <h3 style="margin:8px 0 2px">${esc(d.title)}</h3>
+    <div class="small muted"><a href="#/t/${d.team_id}">${esc(d.team_name)}</a> · <a href="#/c/${d.challenge_id}">${esc(d.challenge_title)}</a></div>
+    <div class="small muted">${new Date(d.starts_at * 1000).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' })} · ${d.duration_min} min</div>
+    <div class="row" style="margin-top:10px">${btn}${opts.cancel ? `<button class="btn sm danger" data-act="cancel-demo" data-id="${d.id}">Cancel</button>` : ''}</div>
+  </div>`;
+}
+
+function perkCard(p) {
+  const action = !me ? '<a class="btn sm ghost" href="#/join">Sign in to claim</a>'
+    : me.role !== 'hacker' ? '' : `<button class="btn sm ${p.claimed ? 'ghost' : ''}" data-act="claim" data-id="${p.id}">${p.claimed ? 'Claimed — open' : 'Claim'}</button>`;
+  return `<div class="perk"><div class="small muted">${PERK_LABEL[p.kind] || esc(p.kind)} · ${esc(p.sponsor_name)}</div>
+    <b>${esc(p.title)}</b>${p.details ? `<div class="small muted">${esc(p.details)}</div>` : ''}
+    <div class="row spread" style="margin-top:6px">${action}<span class="small muted">${p.claims} claimed</span></div></div>`;
+}
+
+const judgeBadge = (s) => s.judge_count ? `<span class="chip hit" title="${s.judge_count} judge score(s)">⚖ ${s.judge_score}/10</span>` : '';
+
+// ---------- views ----------
+
+async function viewHome() {
+  const [stats, live, upcoming, show, sponsors, demos] = await Promise.all([
+    api('/stats'), api('/challenges?status=live'), api('/challenges?status=upcoming'),
+    api('/showcase'), api('/sponsors'), api('/demos')]);
+  const soonDemos = demos.demos.filter((d) => d.status !== 'past').slice(0, 3);
+  const lines = [
+    ...live.challenges.slice(0, 4).map((c) =>
+      `<div class="line"><span class="tag">● live</span><span>${esc(c.title)}</span><span class="dim">ends <span data-until="${c.ends_at}">${until(c.ends_at)}</span></span></div>`),
+    ...upcoming.challenges.slice(0, 2).map((c) =>
+      `<div class="line"><span class="tag">○ next</span><span>${esc(c.title)}</span><span class="dim">in <span data-until="${c.starts_at}">${until(c.starts_at)}</span></span></div>`),
+    ...soonDemos.map((d) => `<div class="line"><span class="tag">▶ demo</span><span>${esc(d.title)}</span><span class="dim">${d.status === 'live' ? 'on now' : 'in <span data-until="' + d.starts_at + '">' + until(d.starts_at) + '</span>'}</span></div>`),
+    `<div class="line"><span class="tag">● floor</span><span>${stats.here_now} hacking right now · ${stats.open_help} hands raised</span></div>`,
+    `<div class="line"><span class="tag">◆ team</span><span>${stats.looking} hackers looking for teammates</span></div>`,
+    `<div class="line"><span class="dim">$ always --on</span></div>`,
+  ];
+  return `
+  <section class="hero">
+    <div>
+      <h1>There's <em>always</em> a hackathon happening.</h1>
+      <p class="lede">Rolling sponsor challenges and a fresh open sprint every Monday. Find a team in minutes, ship something this week, win prizes.</p>
+      <div class="row">
+        <a class="btn lg" href="#/teams">Find a team</a>
+        <a class="btn lg ghost" href="#/floor"><span class="dot"></span>Walk onto the floor${stats.here_now ? ` · ${stats.here_now} here` : ''}</a>
+      </div>
+      ${me ? '' : '<p class="small muted" style="margin-top:12px">No application, no waitlist. <a href="#/join">Join in 30 seconds →</a></p>'}
+    </div>
+    <div class="ticker" aria-label="Live activity">${lines.join('')}</div>
+  </section>
+  <div class="stats">
+    <div class="stat"><b>${stats.live}</b><span>live challenges</span></div>
+    <div class="stat"><b>${stats.hackers}</b><span>hackers</span></div>
+    <div class="stat"><b>${stats.looking}</b><span>looking for a team</span></div>
+    <div class="stat"><b>${stats.teams}</b><span>teams formed</span></div>
+    <div class="stat"><b>${stats.submissions}</b><span>projects shipped</span></div>
+  </div>
+  <section class="section">
+    <div class="section-head"><h2>Live now</h2><a href="#/challenges">All challenges →</a></div>
+    <div class="grid">${live.challenges.map(challengeCard).join('') || empty('Nothing live — check back Monday.')}</div>
+  </section>
+  ${soonDemos.length ? `<section class="section">
+    <div class="section-head"><h2>Demos on Zoom</h2><a href="#/demos">All demos →</a></div>
+    <div class="grid">${soonDemos.map((d) => demoCard(d)).join('')}</div></section>` : ''}
+  ${upcoming.challenges.length ? `<section class="section">
+    <div class="section-head"><h2>Starting soon</h2></div>
+    <div class="grid">${upcoming.challenges.map(challengeCard).join('')}</div></section>` : ''}
+  <section class="section">
+    <div class="section-head"><h2>How it works</h2></div>
+    <div class="grid steps">
+      <div class="card flat"><h3>Pick a challenge</h3><p class="muted small" style="margin:0">Sponsor tracks run for a week or two, on a rolling schedule. The open sprint restarts every Monday.</p></div>
+      <div class="card flat"><h3>Get matched</h3><p class="muted small" style="margin:0">Teams post the roles they need. We rank teams for you by role fit, new skills, interests and timezone.</p></div>
+      <div class="card flat"><h3>Ship &amp; get voted</h3><p class="muted small" style="margin:0">Submit before the clock runs out, demo live on Zoom, and get scored by judges and voted on by the community.</p></div>
+    </div>
+  </section>
+  ${show.projects.length ? `<section class="section">
+    <div class="section-head"><h2>Top projects</h2></div>
+    <div class="grid two">${show.projects.map((p, i) => `<div class="card project"><div class="rank">#${i + 1}</div><div class="body">
+      <h3>${esc(p.title)}</h3><div class="small muted">${esc(p.team_name)} · <a href="#/c/${p.challenge_id}">${esc(p.challenge_title)}</a></div>
+      <p class="small" style="margin:6px 0 0">${esc(p.description)}</p></div><div class="small muted">▲ ${p.votes}</div></div>`).join('')}</div>
+  </section>` : ''}
+  <section class="section">
+    <div class="section-head"><h2>Sponsors</h2><a href="#/sponsor">Put your API in front of builders →</a></div>
+    <div class="sponsor-strip">${sponsors.sponsors.map((s) =>
+      `<span class="sponsor-chip" style="--c:${esc(s.color)}"><i></i>${esc(s.name)}</span>`).join('')}</div>
+  </section>`;
+}
+
+async function viewChallenges(tab = 'live') {
+  const data = await api(`/challenges?status=${tab}`);
+  const tabs = [['live', 'Live'], ['upcoming', 'Upcoming'], ['past', 'Past']];
+  return `<div class="section-head"><h1 style="margin:0">Challenges</h1>
+    <nav class="tabs">${tabs.map(([k, l]) => `<a href="#/challenges/${k}" class="${k === tab ? 'on' : ''}">${l}</a>`).join('')}</nav></div>
+    <div class="grid">${data.challenges.map(challengeCard).join('') || empty('Nothing here yet.')}</div>`;
+}
+
+async function viewChallenge(id) {
+  const d = await api(`/challenges/${id}`);
+  const c = d.challenge;
+  const ctx = { myTeamId: d.my_team_id, pending: d.pending_team_ids };
+  const myTeam = d.teams.find((t) => t.id === d.my_team_id);
+  let side = '';
+  if (myTeam) {
+    side = `<div class="card"><h3>You're on ${esc(myTeam.name)}</h3><p class="small muted">${myTeam.members.length}/${myTeam.max_size} members</p>
+      <div class="row"><a class="btn" href="#/t/${myTeam.id}/room">🚪 Team room</a><a class="btn ghost" href="#/t/${myTeam.id}">${c.status === 'live' ? 'Manage & submit' : 'Manage team'}</a></div></div>`;
+  } else if (c.status !== 'past' && me && me.role === 'hacker') {
+    side = `<form class="card stack" id="new-team"><h3>Start a team</h3>
+      <label>Team name<input name="name" required maxlength="50" placeholder="e.g. Null Pointers"></label>
+      <label>The idea<textarea name="idea" maxlength="600" placeholder="One or two sentences. Rough is fine."></textarea></label>
+      <label>Roles you need<input name="looking_for" placeholder="react, design, ml"><div class="hint">Comma-separated skills. These drive matching.</div></label>
+      <label>Max team size<select name="max_size">${Array.from({ length: c.max_team }, (_, i) => i + 1)
+        .map((n) => `<option ${n === c.max_team ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+      <button class="btn" type="submit">Create team</button></form>`;
+  } else if (!me && c.status !== 'past') {
+    side = `<div class="card"><h3>Want in?</h3><p class="small muted">Create a profile to start a team or request to join one.</p><a class="btn" href="#/join">Join</a></div>`;
+  }
+  const html = `
+  <div class="banner" style="--c:${esc(c.sponsor.color)}">
+    <div class="row"><span class="pill">${{ live: '● Live', upcoming: 'Starting soon', past: 'Ended' }[c.status]}</span><b>${esc(c.sponsor.name)}</b></div>
+    <h1>${esc(c.title)}</h1>
+    <p style="opacity:.9;max-width:60ch;margin:0 0 14px">${esc(c.summary)}</p>
+    <div class="row" style="position:relative;z-index:1">
+      ${c.sponsor.product_url || c.resource_url ? `<button class="btn" data-act="try" data-id="${c.id}">Try ${esc(c.sponsor.name)} →</button>` : ''}
+      ${c.resource_url ? `<a class="btn ghost" href="${esc(c.resource_url)}" target="_blank" rel="noopener">Docs</a>` : ''}
+    </div>
+    <div class="banner-meta">
+      ${c.prize ? `<div><span>Prize</span><b>${esc(c.prize)}</b></div>` : ''}
+      <div><span>${c.status === 'upcoming' ? 'Starts in' : c.status === 'live' ? 'Ends in' : 'Ended'}</span><b>${c.status === 'past' ? fmtDate(c.ends_at)
+        : `<span class="countdown" data-until="${c.status === 'upcoming' ? c.starts_at : c.ends_at}">…</span>`}</b></div>
+      <div><span>Teams</span><b>${c.team_count}</b></div>
+      <div><span>Hackers</span><b>${c.hacker_count}</b></div>
+      <div><span>Team size</span><b>1–${c.max_team}</b></div>
+    </div>
+  </div>
+  <div class="split section" style="margin-top:24px">
+    <div>
+      <div class="card flat"><h2>About</h2><p class="desc">${esc(c.description)}</p>${chips(c.tags)}</div>
+      <section class="section">
+        <div class="section-head"><h2>Teams</h2><span class="muted small">${d.teams.filter((t) => t.open).length} with open spots</span></div>
+        <div class="grid two">${d.teams.map((t) => teamCard(t, { action: c.status === 'past' ? '' : joinAction(t, ctx) })).join('')
+          || empty('No teams yet — be the first.')}</div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>Projects</h2><span class="muted small">Community vote</span></div>
+        <div class="stack">${d.submissions.map((s, i) => `<div class="card project">
+          <div class="rank">#${i + 1}</div>
+          <div class="body"><div class="row"><h3 style="margin:0">${esc(s.title)}</h3>${judgeBadge(s)}</div><div class="small muted">by <a href="#/t/${s.team_id}">${esc(s.team_name)}</a></div>
+            <p class="small" style="margin:6px 0">${esc(s.description)}</p>
+            <div class="row small">${s.repo_url ? `<a href="${esc(s.repo_url)}" target="_blank" rel="noopener">Repo ↗</a>` : ''}
+            ${s.demo_url ? `<a href="${esc(s.demo_url)}" target="_blank" rel="noopener">Demo ↗</a>` : ''}</div></div>
+          <button class="btn vote ${s.voted ? 'on' : ''}" data-act="vote" data-id="${s.id}" aria-label="Vote"><span>▲</span><b>${s.votes}</b></button>
+        </div>`).join('') || empty('No projects yet.')}</div>
+      </section>
+    </div>
+    <aside class="stack">${side}
+      ${d.demos.length ? `<div class="stack"><h3 style="margin:8px 0 0">Demos</h3>${d.demos.map((x) => demoCard(x)).join('')}</div>` : ''}
+      ${d.perks.length ? `<div class="card"><h3>Sponsor support</h3><div class="stack">${d.perks.map(perkCard).join('')}</div></div>` : ''}
+      <div class="card flat small"><b>Rules of the road</b><ul style="padding-left:18px;margin:8px 0 0" class="muted">
+        <li>Start fresh: code written during the challenge window.</li><li>One team per hacker per challenge.</li>
+        <li>Submit a repo or demo link before the deadline.</li><li>Be kind. Help beginners.</li></ul></div>
+    </aside>
+  </div>`;
+  return [html, () => {
+    app.querySelectorAll('[data-until]').forEach((el) => { el.textContent = until(+el.dataset.until); });
+    onSubmit('#new-team', async (v) => {
+      const r = await api('/teams', { ...v, challenge_id: c.id, looking_for: splitList(v.looking_for), max_size: +v.max_size });
+      await refreshMe();
+      toast('Team created');
+      location.hash = `#/t/${r.team.id}`;
+    });
+  }];
+}
+
+async function viewTeams() {
+  const [all, match, ch] = await Promise.all([
+    api('/teams?open=1'),
+    me && me.role === 'hacker' ? api('/match/teams') : Promise.resolve(null),
+    api('/challenges'),
+  ]);
+  const open = ch.challenges.filter((c) => c.status !== 'past');
+  let html = `<h1>Find a team</h1>
+    <p class="muted" style="max-width:60ch">Teams post the roles they need. Request to join, or start your own on any challenge and invite people.</p>`;
+  if (match) {
+    html += `<section class="section"><div class="section-head"><h2>Recommended for you</h2>
+      <a class="small" href="#/me">Tune your skills →</a></div>
+      ${me.skills.length ? '' : '<p class="notice">Add skills to your profile to get better matches.</p>'}
+      <div class="grid two">${match.teams.map((t) => teamCard(t, { showChallenge: true, score: t.score, reasons: t.reasons, action: joinAction(t) })).join('')
+        || empty('No open teams that fit right now — <a href="#/challenges">start one</a>.')}</div></section>`;
+  } else if (!me) {
+    html += `<p class="notice"><a href="#/join">Sign in</a> to see teams ranked for your skills and timezone.</p>`;
+  }
+  html += `<section class="section"><div class="section-head"><h2>All open teams</h2>
+    <select id="filter" style="width:auto;margin:0"><option value="">All challenges</option>
+    ${open.map((c) => `<option value="${c.id}">${esc(c.title)}</option>`).join('')}</select></div>
+    <div class="grid two" id="all-teams">${all.teams.map((t) => `<div data-c="${t.challenge_id}">${teamCard(t, { showChallenge: true, action: joinAction(t) })}</div>`).join('')
+      || empty('No open teams.')}</div></section>`;
+  return [html, () => {
+    app.querySelector('#filter').onchange = (e) => {
+      app.querySelectorAll('#all-teams > [data-c]').forEach((el) => { el.hidden = !!e.target.value && el.dataset.c !== e.target.value; });
+    };
+  }];
+}
+
+async function viewTeam(id) {
+  const d = await api(`/teams/${id}`);
+  const t = d.team;
+  const isMember = me && t.members.some((m) => m.id === me.id);
+  const isOwner = me && me.id === t.owner_id;
+  const sugg = isOwner && t.open && t.challenge_status !== 'past' ? (await api(`/teams/${id}/suggestions`)).people : [];
+  let action = '';
+  if (isMember) action = `<div class="row"><a class="btn" href="#/t/${t.id}/room">🚪 Enter team room</a><button class="btn sm danger" data-act="leave" data-id="${t.id}" data-c="${t.challenge_id}">Leave team</button></div>`;
+  else if (d.my_request && d.my_request.kind === 'join') action = `<button class="btn sm ghost" data-act="decide" data-id="${d.my_request.id}" data-action="cancel">Cancel request</button>`;
+  else if (d.my_request && d.my_request.kind === 'invite') action = `<a class="btn sm" href="#/inbox">You're invited — respond</a>`;
+  else if (t.challenge_status !== 'past') action = joinAction(t, { myTeamId: d.my_team_in_challenge });
+
+  const sub = d.submission;
+  const canSubmit = isMember && t.challenge_status === 'live';
+  let html = `<div class="row small muted"><a href="#/c/${t.challenge_id}">← ${esc(t.challenge_title)}</a>${pill(t.challenge_status)}</div>
+  <div class="row spread" style="margin-top:12px"><h1 style="margin:0">${esc(t.name)}</h1>${action}</div>
+  ${t.idea ? `<p class="muted" style="max-width:65ch;margin-top:8px">${esc(t.idea)}</p>` : ''}
+  <div class="split section" style="margin-top:20px"><div class="stack">
+    <div class="card"><div class="section-head"><h2>Members</h2><span class="small muted">${t.members.length}/${t.max_size}</span></div>
+      <div class="stack">${t.members.map((m) => `<div class="person">${avatar(m)}<div class="who">
+        <a class="name" href="#/u/${esc(m.handle)}">${esc(m.name)}</a> ${m.id === t.owner_id ? '<span class="chip">owner</span>' : ''}
+        <div class="handle">@${esc(m.handle)} · ${tzLabel(m.tz)}</div>${chips(m.skills)}</div></div>`).join('')}</div>
+      ${t.looking_for.length && t.open ? `<div style="margin-top:16px"><div class="small muted" style="margin-bottom:4px">Still looking for</div>${chips(t.looking_for, 'need')}</div>` : ''}
+    </div>`;
+  if (sub) {
+    html += `<div class="card"><h2>Submission</h2><h3>${esc(sub.title)}</h3><p class="small">${esc(sub.description)}</p>
+      <div class="row small">${sub.repo_url ? `<a href="${esc(sub.repo_url)}" target="_blank" rel="noopener">Repo ↗</a>` : ''}
+      ${sub.demo_url ? `<a href="${esc(sub.demo_url)}" target="_blank" rel="noopener">Demo ↗</a>` : ''}</div></div>`;
+  }
+  if (canSubmit) {
+    html += `<details class="card" ${sub ? '' : 'open'}><summary><b>${sub ? 'Update submission' : 'Submit your project'}</b></summary>
+      <form class="stack" id="submit" style="margin-top:12px">
+        <label>Project title<input name="title" required maxlength="80" value="${esc(sub?.title)}"></label>
+        <label>What does it do?<textarea name="description" maxlength="1200">${esc(sub?.description)}</textarea></label>
+        <div class="form-grid"><label>Repo URL<input name="repo_url" type="url" placeholder="https://github.com/…" value="${esc(sub?.repo_url)}"></label>
+        <label>Demo URL<input name="demo_url" type="url" placeholder="https://…" value="${esc(sub?.demo_url)}"></label></div>
+        <button class="btn" type="submit">${sub ? 'Update' : 'Submit'}</button></form></details>`;
+  }
+  if (d.demos.length || (isMember && t.challenge_status !== 'upcoming')) {
+    html += `<div class="card"><div class="section-head"><h2>Live demo</h2></div>
+      ${d.demos.length ? `<div class="grid">${d.demos.map((x) => demoCard(x, { cancel: isMember && x.status !== 'past' })).join('')}</div>` : ''}
+      ${isMember && t.challenge_status !== 'upcoming' ? `<details ${d.demos.length ? '' : 'open'} style="margin-top:12px"><summary><b>Schedule a Zoom demo</b></summary>
+        <p class="small muted">Everyone on Always-On gets notified and can join to watch.</p>
+        <form class="stack" id="demo-form">
+          <label>Title<input name="title" maxlength="80" placeholder="${esc(t.name)} demo"></label>
+          <label>Zoom meeting link<input name="zoom_url" type="url" required placeholder="https://us02web.zoom.us/j/…"></label>
+          <div class="form-grid"><label>Starts<select name="when"><option value="0">Right now</option><option value="900">In 15 minutes</option>
+            <option value="3600">In 1 hour</option><option value="custom">Pick a time…</option></select></label>
+          <label>Length<select name="duration_min"><option>10</option><option selected>15</option><option>30</option><option>60</option></select></label></div>
+          <label data-custom hidden>Start time<input name="at" type="datetime-local"></label>
+          <button class="btn" type="submit">Schedule &amp; notify everyone</button></form></details>` : ''}
+    </div>`;
+  }
+  html += `</div><aside class="stack">`;
+  if (isOwner) {
+    html += `<div class="card"><h3>Requests</h3>${d.requests.length ? `<div class="stack">${d.requests.map((r) => `<div>
+        <div class="person">${avatar(r.user)}<div class="who"><a class="name" href="#/u/${esc(r.user.handle)}">${esc(r.user.name)}</a>
+        <div class="handle">${r.kind === 'invite' ? 'invited — waiting on them' : 'wants to join'}</div>
+        ${r.message ? `<p class="small" style="margin:4px 0">“${esc(r.message)}”</p>` : ''}${chips(r.user.skills, '', t.looking_for)}</div></div>
+        ${r.kind === 'join' ? `<div class="row" style="margin-top:8px"><button class="btn sm" data-act="decide" data-id="${r.id}" data-action="accept">Accept</button>
+        <button class="btn sm ghost" data-act="decide" data-id="${r.id}" data-action="decline">Decline</button></div>`
+        : `<button class="btn sm ghost" style="margin-top:8px" data-act="decide" data-id="${r.id}" data-action="cancel">Withdraw invite</button>`}
+      </div>`).join('')}</div>` : '<p class="small muted" style="margin:0">No pending requests.</p>'}</div>`;
+    if (sugg.length) {
+      html += `<div class="card"><h3>Suggested teammates</h3><p class="small muted">Looking for a team, ranked by fit.</p><div class="stack">
+        ${sugg.map((p) => `<div class="person">${avatar(p)}<div class="who"><div class="row spread"><a class="name" href="#/u/${esc(p.handle)}">${esc(p.name)}</a><b class="small">${p.score}</b></div>
+          ${chips(p.skills, '', t.looking_for)}${reasons(p.reasons)}
+          ${p.pending ? '<span class="small muted">Pending</span>' : `<button class="btn sm" style="margin-top:6px" data-act="invite" data-team="${t.id}" data-user="${p.id}" data-name="${esc(p.name)}">Invite</button>`}
+        </div></div>`).join('')}</div></div>`;
+    }
+    html += `<details class="card"><summary><b>Edit team</b></summary><form class="stack" id="edit-team" style="margin-top:12px">
+      <label>Name<input name="name" required maxlength="50" value="${esc(t.name)}"></label>
+      <label>Idea<textarea name="idea" maxlength="600">${esc(t.idea)}</textarea></label>
+      <label>Roles you need<input name="looking_for" value="${esc(t.looking_for.join(', '))}"></label>
+      <label>Max size<input name="max_size" type="number" min="${t.members.length}" max="8" value="${t.max_size}"></label>
+      <button class="btn" type="submit">Save</button></form></details>`;
+  }
+  html += `</aside></div>`;
+  return [html, () => {
+    const df = app.querySelector('#demo-form');
+    if (df) df.when.onchange = () => { df.querySelector('[data-custom]').hidden = df.when.value !== 'custom'; };
+    onSubmit('#demo-form', async (v) => {
+      const startsAt = v.when === 'custom' ? Math.floor(new Date(v.at).getTime() / 1000) : Math.floor(Date.now() / 1000) + +v.when;
+      if (!startsAt) throw new Error('Pick a start time');
+      await api(`/teams/${t.id}/demos`, { title: v.title, zoom_url: v.zoom_url, starts_at: startsAt, duration_min: +v.duration_min });
+      toast('Demo scheduled — everyone has been notified'); render();
+    });
+    onSubmit('#submit', async (v) => { await api('/submissions', { ...v, team_id: t.id }); toast('Project submitted 🚀'); render(); });
+    onSubmit('#edit-team', async (v) => {
+      await api(`/teams/${t.id}`, { ...v, looking_for: splitList(v.looking_for), max_size: +v.max_size });
+      toast('Saved'); render();
+    });
+  }];
+}
+
+async function viewPeople(params) {
+  const q = params.get('q') || '', skill = params.get('skill') || '', looking = params.get('looking') === '1';
+  const data = await api(`/people?q=${encodeURIComponent(q)}&skill=${encodeURIComponent(skill)}&looking=${looking ? 1 : ''}`);
+  return [`<h1>Hackers</h1>
+    <form class="row" id="pf" style="margin:16px 0 20px">
+      <input name="q" placeholder="Search name, bio, skill…" value="${esc(q)}" style="flex:2;min-width:180px;margin:0">
+      <input name="skill" placeholder="Exact skill, e.g. react" value="${esc(skill)}" style="flex:1;min-width:140px;margin:0">
+      <label class="row small" style="margin:0"><input type="checkbox" name="looking" ${looking ? 'checked' : ''}>Looking for a team</label>
+      <button class="btn" type="submit">Filter</button></form>
+    <div class="grid two">${data.people.map((p) => personCard(p)).join('') || empty('No one matches that.')}</div>`, () => {
+    app.querySelector('#pf').onsubmit = (e) => {
+      e.preventDefault();
+      const v = formValues(e.target);
+      const sp = new URLSearchParams();
+      if (v.q) sp.set('q', v.q);
+      if (v.skill) sp.set('skill', v.skill);
+      if (v.looking) sp.set('looking', '1');
+      location.hash = '#/people' + (sp.toString() ? '?' + sp : '');
+    };
+  }];
+}
+
+async function viewPerson(handle) {
+  const d = await api(`/people/${handle}`);
+  const p = d.person;
+  let invite = '';
+  if (me && me.role === 'hacker' && me.id !== p.id && p.role === 'hacker') {
+    const mine = (await api(`/people/${me.handle}`)).teams.filter((t) =>
+      t.owner_id === me.id && t.open && t.challenge_status !== 'past' && !d.teams.some((x) => x.challenge_id === t.challenge_id));
+    if (mine.length) {
+      invite = `<div class="card"><h3>Invite ${esc(p.name.split(' ')[0])}</h3><div class="stack">${mine.map((t) =>
+        `<div class="row spread"><span class="small">${esc(t.name)} <span class="muted">· ${esc(t.challenge_title)}</span></span>
+        <button class="btn sm" data-act="invite" data-team="${t.id}" data-user="${p.id}" data-name="${esc(p.name)}">Invite</button></div>`).join('')}</div></div>`;
+    }
+  }
+  return `<div class="split"><div class="stack">${personCard(p, p.helped ? `<p class="small" style="margin:10px 0 0">🙌 Helped <b>${p.helped}</b> hacker${p.helped === 1 ? '' : 's'} get unstuck on the floor</p>` : '')}
+    <section class="section"><h2>Teams</h2><div class="grid two">${d.teams.map((t) => teamCard(t, { showChallenge: true })).join('') || empty('Not on any teams yet.')}</div></section>
+    </div><aside class="stack">${invite}
+    ${p.interests.length ? `<div class="card flat"><h3>Interests</h3>${chips(p.interests)}</div>` : ''}</aside></div>`;
+}
+
+async function viewDemos() {
+  const d = await api('/demos');
+  const by = (st) => d.demos.filter((x) => x.status === st);
+  const sec = (title, list, none) => `<section class="section"><h2>${title}</h2><div class="grid">${list.map((x) => demoCard(x)).join('') || empty(none)}</div></section>`;
+  return `<h1>Demos</h1><p class="muted" style="max-width:60ch">Teams demo live on Zoom. You'll get a notification when a new demo is scheduled — hit “I'll watch” to save it.</p>
+    ${sec('Live now', by('live'), 'No one is on stage right now.')}
+    ${sec('Coming up', by('upcoming'), 'Nothing scheduled yet. On a team? Schedule one from your team page.')}
+    ${by('past').length ? sec('Earlier today', by('past'), '') : ''}`;
+}
+
+async function viewNotifications() {
+  if (!me) { location.hash = '#/join'; return ''; }
+  const d = await api('/notifications');
+  if (me.unread) { await api('/notifications/read', {}); me.unread = 0; renderNav(); }
+  return `<h1>Notifications</h1><div class="stack" style="max-width:720px">${d.notifications.map((n) =>
+    `<a class="card notif ${n.read ? '' : 'unread'}" href="${esc(n.link || '#/')}"><span>${esc(n.text)}</span><span class="small muted">${ago(n.created_at)}</span></a>`).join('')
+    || empty('All quiet. You\'ll hear about demos, invites and team updates here.')}</div>`;
+}
+
+async function viewJudge() {
+  if (!me || me.role !== 'judge') {
+    return empty('This area is for judges. <a href="#/join?judge=1">Sign up with a judge code</a> or try the demo judge <button class="btn sm" data-act="login-as" data-handle="judy">@judy</button>');
+  }
+  const d = await api('/judge/queue');
+  const todo = d.submissions.filter((x) => !x.my_score).length;
+  const rubric = { innovation: 'Innovation', technical: 'Technical depth', design: 'Design & UX', impact: 'Impact' };
+  return [`<div class="row spread"><h1 style="margin:0">Judging</h1><span class="pill ${todo ? 'upcoming' : 'live'}">${todo ? `${todo} to score` : 'All scored'}</span></div>
+    <p class="muted">Score each project 1–10 on four criteria. Teams see the average, not who gave it.</p>
+    <div class="stack">${d.submissions.map((x) => `<div class="card"><div class="split" style="gap:20px">
+      <div><div class="row">${pill(x.challenge_status)}<span class="small muted">${esc(x.challenge_title)}</span></div>
+        <h2 style="margin:8px 0 2px">${esc(x.title)}</h2>
+        <div class="small muted">by <a href="#/t/${x.team_id}">${esc(x.team_name)}</a> · ${x.members.map((m) => '@' + esc(m.handle)).join(', ')}</div>
+        <p class="small" style="margin:10px 0">${esc(x.description)}</p>
+        <div class="row small">${x.repo_url ? `<a href="${esc(x.repo_url)}" target="_blank" rel="noopener">Repo ↗</a>` : ''}
+        ${x.demo_url ? `<a href="${esc(x.demo_url)}" target="_blank" rel="noopener">Demo ↗</a>` : ''}
+        <span class="muted">▲ ${x.votes} votes</span>${judgeBadge(x)}</div></div>
+      <form class="stack score-form" data-id="${x.id}">
+        ${d.rubric.map((f) => `<label>${rubric[f]} <output>${x.my_score ? x.my_score[f] : 5}</output>
+          <input type="range" name="${f}" min="1" max="10" value="${x.my_score ? x.my_score[f] : 5}"></label>`).join('')}
+        <label>Feedback for the team<textarea name="comment" rows="2" maxlength="1000">${esc(x.my_score?.comment)}</textarea></label>
+        <button class="btn" type="submit">${x.my_score ? 'Update score' : 'Submit score'}</button>
+      </form></div></div>`).join('') || empty('No projects submitted yet.')}</div>`, () => {
+    app.querySelectorAll('.score-form').forEach((f) => {
+      f.addEventListener('input', (e) => { if (e.target.type === 'range') e.target.previousElementSibling.textContent = e.target.value; });
+      f.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const v = formValues(f);
+        try {
+          const r = await api(`/submissions/${f.dataset.id}/score`, { ...v, innovation: +v.innovation, technical: +v.technical, design: +v.design, impact: +v.impact });
+          toast(`Saved — average now ${r.judge_score}/10`); render();
+        } catch (err) { toast(err.message, true); }
+      });
+    });
+  }];
+}
+
+let floorTimer = null;
+let floorFilter = 'all';
+let floorVisibilityBound = false;
+
+function whoLine(u) {
+  const where = u.org ? `<span class="chip org">${esc(u.org)}</span>` : u.role === 'judge' ? '<span class="chip org">judge</span>'
+    : u.team ? `<a href="#/t/${u.team.id}">${esc(u.team.name)}</a>` : '';
+  return `<a class="name" href="#/u/${esc(u.handle)}">${esc(u.name)}</a> ${where}`;
+}
+
+function floorHere(f) {
+  return `<div class="row spread"><h3 style="margin:0"><span class="dot"></span> Here now</h3><span class="small muted">${f.here.length}</span></div>
+    <div class="stack" style="margin-top:12px">${f.here.map((u) => `<div class="person">${avatar(u)}<div class="who">
+      <div>${whoLine(u)}</div><div class="small">${esc(u.status) || '<span class="muted">heads down</span>'}</div>
+      <div class="small muted">here since ${new Date(u.since * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}${u.helped ? ` · 🙌 helped ${u.helped}` : ''}</div>
+    </div></div>`).join('') || '<p class="small muted" style="margin:0">Quiet right now. Walk on and get it started.</p>'}</div>`;
+}
+
+function floorPost(p) {
+  const mine = me && p.author.id === me.id;
+  const badge = p.kind === 'help'
+    ? (p.resolved_by ? `<span class="pill live">Solved by @${esc(p.resolved_by.handle)}</span>` : '<span class="pill upcoming">🙋 Needs a hand</span>')
+    : p.ritual ? `<a class="pill past" href="#/live/${esc(p.ritual)}">🔔 Check-in</a>` : '<span class="pill past">Ship log</span>';
+  const repliers = [...new Map(p.replies.filter((r) => r.author.id !== p.author.id).map((r) => [r.author.id, r.author])).values()];
+  return `<div class="card post ${p.kind === 'help' && !p.resolved_by ? 'open-help' : ''}"><div class="person">${avatar(p.author)}<div class="who">
+    <div class="row spread"><div>${whoLine(p.author)} <span class="small muted">· ${ago(p.created_at)}</span></div>${badge}</div>
+    <p style="margin:6px 0">${esc(p.text)}</p>${p.tags.length ? chips(p.tags, '', me ? me.skills : []) : ''}
+    ${p.replies.length ? `<div class="replies">${p.replies.map((r) => `<div class="reply">${avatar(r.author)}<div><b>${esc(r.author.name)}</b>
+      ${r.author.org ? `<span class="chip org">${esc(r.author.org)}</span>` : ''} <span class="small muted">${ago(r.created_at)}</span>
+      <div class="small">${esc(r.text)}</div></div></div>`).join('')}</div>` : ''}
+    <div class="row" style="margin-top:10px">
+      <button class="btn sm ghost ${p.highfived ? 'on' : ''}" data-act="highfive" data-id="${p.id}">🙌 <b>${p.highfives}</b></button>
+      <button class="btn sm ghost" data-act="reply" data-id="${p.id}" data-kind="${p.kind}" data-name="${esc(p.author.name)}">${p.kind === 'help' && !p.resolved_by && !mine ? 'I can help' : 'Reply'}</button>
+      ${mine && p.kind === 'help' && !p.resolved_by && repliers.length ? `<button class="btn sm" data-act="resolve" data-id="${p.id}"
+        data-helpers="${esc(JSON.stringify(repliers.map((r) => [r.id, r.name])))}">Mark solved</button>` : ''}
+    </div></div></div></div>`;
+}
+
+function floorFeed(f) {
+  const posts = f.posts.filter((p) => floorFilter === 'all' || (floorFilter === 'help' ? p.kind === 'help' && !p.resolved_by : p.kind === 'update'));
+  return posts.map(floorPost).join('') || empty(floorFilter === 'help' ? 'No open hands. Everyone is unstuck 🎉' : 'Nothing yet — post the first update.');
+}
+
+async function viewFloor() {
+  const f = await api('/floor');
+  const openHelp = f.posts.filter((p) => p.kind === 'help' && !p.resolved_by).length;
+  const checkin = !me ? `<div class="card checkin"><b>This is the hacking floor.</b> <span class="muted">See who's building right now, share progress, and raise your hand when you're stuck.</span>
+      <a class="btn" href="#/join">Join to walk in</a></div>`
+    : f.me_here ? `<form class="card checkin" id="checkin"><span class="dot"></span><b>You're on the floor.</b>
+      <input name="status" maxlength="120" value="${esc(f.here.find((h) => h.id === me.id)?.status)}" placeholder="What are you working on?">
+      <button class="btn sm ghost" type="submit">Update</button><button class="btn sm danger" type="button" data-act="step-out">Step out</button></form>`
+    : `<form class="card checkin" id="checkin"><input name="status" maxlength="120" placeholder="What are you working on right now?" required>
+      <button class="btn" type="submit">Walk onto the floor</button></form>`;
+  const tabs = [['all', 'Everything'], ['help', `Hands raised${openHelp ? ` (${openHelp})` : ''}`], ['update', 'Ship log']];
+  return [`<div class="row spread"><div><h1 style="margin:0">The Floor</h1>
+      <p class="muted" style="margin:4px 0 0">The room at 2am, online. Who's building, what shipped, who's stuck.</p></div></div>
+    <div class="split section" style="margin-top:20px"><div class="stack">
+      ${checkin}
+      ${me ? `<form class="card stack" id="composer">
+        <nav class="tabs"><button type="button" class="on" data-kind="update">📦 Ship update</button><button type="button" data-kind="help">🙋 Raise your hand</button></nav>
+        <textarea name="text" required maxlength="500" rows="2" placeholder="What did you just get working?"></textarea>
+        <label data-help hidden>What skills could help?<input name="tags" placeholder="react, auth, swift"><div class="hint">People on the floor with these skills (and matching sponsors) get a tap on the shoulder.</div></label>
+        <div class="row spread"><span class="small muted" data-hint>Small wins count. Posting keeps your team visible.</span><button class="btn" type="submit">Post</button></div>
+      </form>` : ''}
+      <nav class="tabs" id="floor-tabs">${tabs.map(([k, l]) => `<button type="button" data-filter="${k}" class="${k === floorFilter ? 'on' : ''}">${l}</button>`).join('')}</nav>
+      <div class="stack" id="floor-feed">${floorFeed(f)}</div>
+    </div><aside class="card" id="floor-here">${floorHere(f)}</aside></div>`, () => {
+    const refresh = async () => {
+      const next = await api('/floor');
+      // Only touch the DOM when something changed, so buttons don't vanish mid-click.
+      for (const [id, html] of [['floor-feed', floorFeed(next)], ['floor-here', floorHere(next)]]) {
+        const el = document.getElementById(id);
+        if (el && el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+      }
+    };
+    document.getElementById('floor-feed').dataset.html = floorFeed(f);
+    document.getElementById('floor-here').dataset.html = floorHere(f);
+    floorTimer = setInterval(() => { if (!document.hidden) refresh().catch(() => {}); }, 8000);
+    if (!floorVisibilityBound) {
+      floorVisibilityBound = true;
+      document.addEventListener('visibilitychange', () => { if (!document.hidden && location.hash.startsWith('#/floor')) render(); });
+    }
+    app.querySelectorAll('#floor-tabs [data-filter]').forEach((b) => {
+      b.onclick = () => { floorFilter = b.dataset.filter; render(); };
+    });
+    onSubmit('#checkin', async (v) => { await api('/floor/checkin', v); await refreshMe(); toast('You\'re on the floor 👋'); render(); });
+    const comp = app.querySelector('#composer');
+    if (comp) {
+      let kind = 'update';
+      comp.querySelectorAll('[data-kind]').forEach((b) => {
+        b.onclick = () => {
+          kind = b.dataset.kind;
+          comp.querySelectorAll('[data-kind]').forEach((x) => x.classList.toggle('on', x === b));
+          comp.querySelector('[data-help]').hidden = kind !== 'help';
+          comp.text.placeholder = kind === 'help' ? "What are you stuck on? Error messages welcome." : 'What did you just get working?';
+          comp.querySelector('[data-hint]').textContent = kind === 'help' ? 'Someone on the floor has probably hit this before.' : 'Small wins count. Posting keeps your team visible.';
+        };
+      });
+      onSubmit('#composer', async (v) => {
+        await api('/posts', { kind, text: v.text, tags: splitList(v.tags) });
+        toast(kind === 'help' ? 'Hand raised — tapping the right shoulders 🙋' : 'Posted 📦');
+        render();
+      });
+    }
+  }];
+}
+
+async function viewInbox() {
+  if (!me) { location.hash = '#/join'; return ''; }
+  const d = await api('/inbox');
+  const item = (r, actions) => `<div class="card person">${avatar(r.user)}<div class="who">
+    <div><a class="name" href="#/u/${esc(r.user.handle)}">${esc(r.user.name)}</a> → <a href="#/t/${r.team_id}">${esc(r.team_name)}</a>
+    <span class="small muted">· ${esc(r.challenge_title)}</span></div>
+    ${r.message ? `<p class="small" style="margin:4px 0">“${esc(r.message)}”</p>` : ''}${chips(r.user.skills)}
+    <div class="row" style="margin-top:8px">${actions}</div></div></div>`;
+  const decide = (r) => `<button class="btn sm" data-act="decide" data-id="${r.id}" data-action="accept">Accept</button>
+    <button class="btn sm ghost" data-act="decide" data-id="${r.id}" data-action="decline">Decline</button>`;
+  return `<h1>Inbox</h1>
+    <section class="section"><h2>Invites for you</h2><div class="stack">${d.invites.map((r) => item(r, decide(r))).join('') || empty('No invites yet. <a href="#/me">Make sure “looking for a team” is on.</a>')}</div></section>
+    <section class="section"><h2>Requests to join your teams</h2><div class="stack">${d.join_requests.map((r) => item(r, decide(r))).join('') || empty('Nothing pending.')}</div></section>
+    <section class="section"><h2>Sent</h2><div class="stack">${d.outgoing.map((r) => item(r,
+      `<span class="chip">${r.kind === 'join' ? 'you asked to join' : 'you invited'}</span><span class="chip ${r.status === 'accepted' ? 'hit' : ''}">${esc(r.status)}</span>
+      ${r.status === 'pending' ? `<button class="btn sm ghost" data-act="decide" data-id="${r.id}" data-action="cancel">Withdraw</button>` : ''}`)).join('') || empty('Nothing sent in the last 30 days.')}</div></section>`;
+}
+
+async function viewProfile() {
+  if (!me) { location.hash = '#/join'; return ''; }
+  return [`<div class="split"><form class="card stack" id="profile"><h1>Your profile</h1>
+    <div class="form-grid"><label>Name<input name="name" required maxlength="60" value="${esc(me.name)}"></label>
+    <label>Timezone<select name="tz">${tzOptions(me.tz)}</select></label></div>
+    <label>Bio<textarea name="bio" maxlength="280">${esc(me.bio)}</textarea></label>
+    ${me.role === 'hacker' ? `<label>Skills<input name="skills" value="${esc(me.skills.join(', '))}" placeholder="python, react, design"><div class="hint">Comma-separated. Teams match on these.</div></label>
+    <label>Interests<input name="interests" value="${esc(me.interests.join(', '))}" placeholder="ai, fintech, accessibility"></label>
+    <label class="row"><input type="checkbox" name="looking" ${me.looking ? 'checked' : ''}>I'm looking for a team (show me to team owners)</label>` : ''}
+    <div class="row"><button class="btn" type="submit">Save</button><button type="button" class="btn ghost" data-act="logout">Sign out</button></div>
+  </form><aside class="stack"><div class="card flat"><div class="row">${avatar(me, 'lg')}<div><b>@${esc(me.handle)}</b><div class="small muted">${me.role}</div></div></div>
+    <p class="small muted" style="margin:12px 0 0"><a href="#/u/${esc(me.handle)}">View public profile →</a></p>
+    ${me.role === 'sponsor' ? '<p class="small" style="margin:8px 0 0"><a href="#/sponsor">Sponsor dashboard →</a></p>' : ''}</div></aside></div>`, () => {
+    onSubmit('#profile', async (v) => {
+      await api('/me', { ...v, tz: +v.tz, skills: splitList(v.skills), interests: splitList(v.interests) });
+      await refreshMe();
+      toast('Profile saved');
+    });
+  }];
+}
+
+async function viewSponsor() {
+  if (!me || me.role !== 'sponsor') {
+    return `<section class="hero"><div><h1>Builders, <em>every week</em>. Not once a year.</h1>
+      <p class="lede">Run a rolling challenge on your API. Hackers find your product, form teams around it, and ship real projects — while you watch the funnel.</p>
+      <div class="row"><a class="btn lg" href="#/join?sponsor=1">Launch a challenge</a>
+      <button class="btn lg ghost" data-act="login-as" data-handle="nimbus">See a demo dashboard</button></div></div>
+      <div class="ticker"><div class="line"><span class="tag">views</span><span>who saw your challenge</span></div>
+      <div class="line"><span class="tag">clicks</span><span>who tried your product</span></div>
+      <div class="line"><span class="tag">teams</span><span>who built with it</span></div>
+      <div class="line"><span class="tag">skills</span><span>what your builders know</span></div></div></section>
+      <div class="grid steps section">
+        <div class="card flat"><h3>Always-on reach</h3><p class="small muted" style="margin:0">Your challenge sits next to a live, weekly community instead of one weekend's crowd.</p></div>
+        <div class="card flat"><h3>A funnel you can measure</h3><p class="small muted" style="margin:0">Page views → product clicks → teams → shipped projects, all on one dashboard.</p></div>
+        <div class="card flat"><h3>Talent signal</h3><p class="small muted" style="margin:0">See the top skills of the people building on your platform. Great for DevRel and hiring.</p></div>
+      </div>`;
+  }
+  const a = await api('/sponsor/analytics');
+  const t = a.totals;
+  const maxV = Math.max(1, ...a.daily_views.map((x) => x.views));
+  const maxS = Math.max(1, ...a.top_skills.map((x) => x[1]));
+  const tile = (n, label) => `<div class="stat"><b>${n ?? 0}</b><span>${label}</span></div>`;
+  const nextMon = new Date(); nextMon.setDate(nextMon.getDate() + ((8 - nextMon.getDay()) % 7 || 7)); nextMon.setHours(9, 0, 0, 0);
+  const localIso = (dt) => new Date(dt - dt.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  return [`<div class="row spread"><div><div class="small muted">Sponsor dashboard</div><h1 style="margin:0">${esc(a.sponsor.name)}</h1></div>
+    <a class="btn" href="#new-challenge" data-act="scroll" data-target="new-challenge">+ New challenge</a></div>
+    <div class="stats">${tile(t.views, 'challenge views')}${tile(t.clicks, 'product clicks')}${tile(t.ctr + '%', 'click-through')}
+      ${tile(t.teams, 'teams formed')}${tile(t.hackers, 'hackers building')}${tile(t.submissions, 'projects shipped')}${tile(t.perk_claims, 'support claimed')}</div>
+    <div class="grid two section">
+      <div class="card"><h3>Views, last 14 days</h3><div class="spark">${a.daily_views.map((x) =>
+        `<div style="height:${(100 * x.views / maxV).toFixed(1)}%" title="${fmtDate(x.day)}: ${x.views} views"></div>`).join('')}</div>
+        <div class="spark-labels"><span>${fmtDate(a.daily_views[0].day)}</span><span>today</span></div></div>
+      <div class="card"><h3>What your builders know</h3>${a.top_skills.length ? `<div class="bars">${a.top_skills.map(([s, n]) =>
+        `<div class="bar"><span>${esc(s)}</span><div class="track"><div class="fill" style="width:${(100 * n / maxS).toFixed(1)}%"></div></div><span class="n">${n}</span></div>`).join('')}</div>`
+        : '<p class="small muted">Shows up once teams form on your challenges.</p>'}</div>
+    </div>
+    <section class="section card"><h3>Challenges</h3><div class="table-wrap"><table>
+      <thead><tr><th>Challenge</th><th>Status</th><th class="num">Views</th><th class="num">Clicks</th><th class="num">CTR</th><th class="num">Teams</th><th class="num">Hackers</th><th class="num">Projects</th></tr></thead>
+      <tbody>${a.challenges.map((c) => `<tr><td><a href="#/c/${c.id}">${esc(c.title)}</a></td><td>${pill(c.status)}</td>
+        <td class="num">${c.views}</td><td class="num">${c.clicks}</td><td class="num">${c.ctr}%</td><td class="num">${c.team_count}</td>
+        <td class="num">${c.hacker_count}</td><td class="num">${c.submission_count}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">No challenges yet.</td></tr>'}</tbody>
+    </table></div></section>
+    <section class="section grid two">
+      <div class="card"><h3>Support you're offering</h3>${a.perks.length ? `<div class="stack">${a.perks.map((p) => `<div class="perk">
+        <div class="small muted">${PERK_LABEL[p.kind]} · ${p.challenge_title ? esc(p.challenge_title) : 'all your challenges'}</div>
+        <b>${esc(p.title)}</b><div class="small muted">${p.claims} hackers claimed</div></div>`).join('')}</div>` : '<p class="small muted">Nothing yet — credits and office hours are the fastest way to get teams building on you.</p>'}</div>
+      <form class="card stack" id="new-perk"><h3>Offer support</h3>
+        <div class="form-grid"><label>Type<select name="kind">${Object.entries(PERK_LABEL).map(([k, l]) => `<option value="${k}">${l}</option>`).join('')}</select></label>
+        <label>For<select name="challenge_id"><option value="">All my challenges</option>${a.challenges.filter((c) => c.status !== 'past').map((c) => `<option value="${c.id}">${esc(c.title)}</option>`).join('')}</select></label></div>
+        <label>Title<input name="title" required maxlength="80" placeholder="$500 in credits per team"></label>
+        <label>Details<textarea name="details" rows="2" maxlength="600" placeholder="How to redeem, office-hour times, who to ask…"></textarea></label>
+        <label>Link<input name="link" type="url" placeholder="https://… (redeem page, Zoom, Calendly)"></label>
+        <button class="btn" type="submit">Publish</button></form>
+    </section>
+    <form class="card stack section" id="new-challenge"><h2>Launch a challenge</h2>
+      <label>Title<input name="title" required maxlength="80" placeholder="Build a voice agent with our API"></label>
+      <label>One-line summary<input name="summary" maxlength="160"></label>
+      <label>Details &amp; judging criteria<textarea name="description" maxlength="4000" rows="5"></textarea></label>
+      <div class="form-grid">
+        <label>Prize<input name="prize" maxlength="120" placeholder="$2,000 + credits"></label>
+        <label>Tags<input name="tags" placeholder="ai, voice, mobile"><div class="hint">Matched against hacker interests.</div></label>
+        <label>Docs / starter kit URL<input name="resource_url" type="url" placeholder="https://"></label>
+        <label>Max team size<input name="max_team" type="number" min="1" max="8" value="4"></label>
+        <label>Starts<input name="starts" type="datetime-local" required value="${localIso(nextMon)}"></label>
+        <label>Length (days)<input name="days" type="number" min="1" max="60" value="7"></label>
+      </div>
+      <button class="btn" type="submit">Launch</button></form>`, () => {
+    onSubmit('#new-perk', async (v) => {
+      await api('/perks', { ...v, challenge_id: v.challenge_id ? +v.challenge_id : null });
+      toast('Support published'); render();
+    });
+    onSubmit('#new-challenge', async (v) => {
+      const starts = Math.floor(new Date(v.starts).getTime() / 1000);
+      const r = await api('/challenges', { ...v, tags: splitList(v.tags), max_team: +v.max_team, starts_at: starts, ends_at: starts + (+v.days) * 86400 });
+      toast('Challenge launched');
+      location.hash = `#/c/${r.challenge.id}`;
+    });
+  }];
+}
+
+async function viewJoin(params) {
+  if (me) { location.hash = '#/me'; return ''; }
+  const initial = params.get('sponsor') === '1' ? 'sponsor' : params.get('judge') === '1' ? 'judge' : 'hacker';
+  const demo = [['ben', 'Ben — frontend, has an invite'], ['lena', 'Lena — NLP, looking'], ['ada', 'Ada — owns a team, live demo'],
+    ['judy', 'Judy — judge'], ['nimbus', 'Nimbus — sponsor']];
+  const roleTab = (val, label) => `<label class="${initial === val ? 'on' : ''}" style="padding:6px 14px;border-radius:9px;cursor:pointer"><input type="radio" name="role" value="${val}" ${initial === val ? 'checked' : ''} hidden>${label}</label>`;
+  return [`<div class="split"><div class="card">
+    <nav class="tabs" style="margin-bottom:18px"><button type="button" class="on" data-tab="signup">Create profile</button><button type="button" data-tab="login">Sign in</button></nav>
+    <form class="stack" id="signup">
+      <div class="tabs" role="radiogroup">${roleTab('hacker', "I'm a hacker")}${roleTab('judge', "I'm a judge")}${roleTab('sponsor', "I'm a sponsor")}</div>
+      <div class="form-grid"><label>Your name<input name="name" required maxlength="60"></label>
+      <label>Handle<input name="handle" required pattern="[a-z0-9_\\-]{2,24}" maxlength="24" placeholder="lowercase, no spaces"></label></div>
+      <div data-for="sponsor" class="stack">
+        <div class="form-grid"><label>Company<input name="org" maxlength="60"></label><label>Brand color<input name="color" type="color" value="#ff6b35"></label></div>
+        <label>Tagline<input name="tagline" maxlength="140" placeholder="What your product does, in one line"></label>
+        <div class="form-grid"><label>Website<input name="website" type="url" placeholder="https://"></label>
+        <label>Product sign-up URL<input name="product_url" type="url" placeholder="https://"><div class="hint">Where “Try it” sends hackers. Clicks are tracked.</div></label></div>
+      </div>
+      <div data-for="judge" class="stack">
+        <label>Judge code<input name="judge_code" autocomplete="off"><div class="hint">Organizers hand these out. Demo code: <span class="mono">judge-demo</span></div></label>
+      </div>
+      <div data-for="hacker" class="stack">
+        <label>Skills<input name="skills" placeholder="python, react, design"><div class="hint">Comma-separated. This is what teams match on.</div></label>
+        <label>Interests<input name="interests" placeholder="ai, fintech, accessibility"></label>
+        <label>One-line bio<input name="bio" maxlength="280"></label>
+      </div>
+      <label>Timezone<select name="tz">${tzOptions(browserTz())}</select></label>
+      <button class="btn lg" type="submit">Let's go</button>
+    </form>
+    <form class="stack" id="login" hidden>
+      <label>Handle<input name="handle" required placeholder="ada"></label>
+      <button class="btn" type="submit">Sign in</button>
+      <p class="small muted" style="margin:0">Demo mode: sign-in is handle-only. Production would use MyMLH / GitHub OAuth.</p>
+    </form>
+  </div>
+  <aside class="card flat"><h3>Try a demo account</h3><p class="small muted">Jump in as someone from the seed data.</p><div class="stack">
+    ${demo.map(([h, l]) => `<button class="btn ghost" style="width:100%;justify-content:flex-start" data-act="login-as" data-handle="${h}">@${h} <span class="muted small" style="font-weight:400">${l}</span></button>`).join('')}
+  </div></aside></div>`, () => {
+    const signup = app.querySelector('#signup');
+    const sync = () => {
+      const role = signup.querySelector('input[name=role]:checked').value;
+      signup.querySelectorAll('[role=radiogroup] label').forEach((l) => l.classList.toggle('on', l.querySelector('input').checked));
+      signup.querySelectorAll('[data-for]').forEach((el) => { el.hidden = el.dataset.for !== role; });
+      signup.querySelector('[name=org]').required = role === 'sponsor';
+      signup.querySelector('[name=judge_code]').required = role === 'judge';
+    };
+    signup.addEventListener('change', sync);
+    sync();
+    app.querySelectorAll('[data-tab]').forEach((b) => {
+      b.onclick = () => {
+        app.querySelectorAll('[data-tab]').forEach((x) => x.classList.toggle('on', x === b));
+        app.querySelector('#signup').hidden = b.dataset.tab !== 'signup';
+        app.querySelector('#login').hidden = b.dataset.tab !== 'login';
+      };
+    });
+    onSubmit('#signup', async (v) => {
+      await api('/signup', { ...v, tz: +v.tz, skills: splitList(v.skills), interests: splitList(v.interests) });
+      await refreshMe();
+      toast(`Welcome, ${me.name.split(' ')[0]}!`);
+      location.hash = home();
+    });
+    onSubmit('#login', async (v) => { await login(v.handle); });
+  }];
+}
+
+const home = () => ({ sponsor: '#/sponsor', judge: '#/judge' }[me.role] || '#/teams');
+
+async function login(handle) {
+  await api('/login', { handle });
+  await refreshMe();
+  toast(`Signed in as @${me.handle}`);
+  location.hash = home();
+  render();
+}
+
+// Demo mode: the server approves join requests on the owner's behalf after a short wait.
+async function awaitApproval(el, tid, seconds) {
+  el.disabled = true;
+  el.textContent = 'Waiting for approval…';
+  toast(`Request sent — waiting for ${el.dataset.name} to approve…`);
+  const deadline = Date.now() + seconds * 1000 + 6000;
+  await new Promise((ok) => setTimeout(ok, seconds * 1000));
+  while (Date.now() < deadline) {
+    const t = (await api(`/teams/${tid}`)).team;
+    if (t.members.some((m) => m.id === me.id)) {
+      await refreshMe();
+      toast(`You're in! Welcome to ${t.name} 🎉`);
+      location.hash = `#/t/${tid}/room`;
+      return;
+    }
+    await new Promise((ok) => setTimeout(ok, 500));
+  }
+  toast('Still pending — the team owner will decide');
+  render();
+}
+
+// ---------- actions ----------
+
+const actions = {
+  menu: () => nav.classList.toggle('open'),
+  async logout() { await api('/logout', {}); me = null; renderNav(); location.hash = '#/'; },
+  'login-as': (el) => login(el.dataset.handle),
+  scroll: (el) => document.getElementById(el.dataset.target)?.scrollIntoView({ behavior: 'smooth' }),
+  async try(el) {
+    const w = window.open('', '_blank');
+    const { url } = await api(`/challenges/${el.dataset.id}/click`, {});
+    if (w && url) { w.opener = null; w.location = url; } else if (w) w.close();
+  },
+  async 'step-out'() { await api('/floor/leave', {}); await refreshMe(); toast('Stepped out — see you soon'); render(); },
+  async highfive(el) {
+    if (!me) { location.hash = '#/join'; return; }
+    const r = await api(`/posts/${el.dataset.id}/highfive`, {});
+    el.classList.toggle('on', r.on);
+    el.querySelector('b').textContent = r.count;
+  },
+  reply(el) {
+    if (!me) { location.hash = '#/join'; return; }
+    const helping = el.dataset.kind === 'help' && el.textContent.trim() === 'I can help';
+    modal(helping ? `Help ${el.dataset.name}` : `Reply to ${el.dataset.name}`,
+      `<label>${helping ? 'Your suggestion, or offer to hop on a call' : 'Reply'}<textarea name="text" required maxlength="500"></textarea></label>`,
+      helping ? 'Send help' : 'Reply', async (v) => { await api(`/posts/${el.dataset.id}/reply`, v); toast('Sent'); render(); });
+  },
+  resolve(el) {
+    const helpers = JSON.parse(el.dataset.helpers);
+    modal('Who got you unstuck?', `<label>They'll get +1 helper karma on their profile<select name="helper_id">
+      ${helpers.map(([id, name]) => `<option value="${id}">${esc(name)}</option>`).join('')}</select></label>`,
+      'Mark solved 🙌', async (v) => { await api(`/posts/${el.dataset.id}/resolve`, { helper_id: +v.helper_id }); toast('Solved — karma sent 🙌'); render(); });
+  },
+  async watch(el) {
+    if (!me) { location.hash = '#/join'; return; }
+    const w = window.open('', '_blank');
+    const r = await api(`/demos/${el.dataset.id}/watch`, {});
+    if (r.status === 'upcoming') {
+      w?.close();
+      toast("Saved — you'll find it under Demos. Link opens when it starts.");
+      render();
+      return;
+    }
+    if (w) { w.opener = null; w.location = r.zoom_url; }
+  },
+  async 'cancel-demo'(el) {
+    if (!confirm('Cancel this demo? Watchers will be notified.')) return;
+    await api(`/demos/${el.dataset.id}/cancel`, {});
+    toast('Demo cancelled'); render();
+  },
+  async claim(el) {
+    const w = window.open('', '_blank');
+    const r = await api(`/perks/${el.dataset.id}/claim`, {});
+    if (w && r.link) { w.opener = null; w.location = r.link; } else { w?.close(); toast(r.details || 'Claimed!'); }
+    render();
+  },
+  join(el) {
+    modal(`Join ${el.dataset.name}`, `<label>Say hi — what would you work on?<textarea name="message" maxlength="400" placeholder="I can take the frontend and the demo video."></textarea></label>`,
+      'Send request', async (v) => {
+        const tid = el.dataset.id;
+        const r = await api(`/teams/${tid}/join`, v);
+        if (!r.auto_approve_in) { toast('Request sent'); render(); return; }
+        awaitApproval(el, tid, r.auto_approve_in); // not awaited, so the dialog closes now
+      });
+  },
+
+  invite(el) {
+    modal(`Invite ${el.dataset.name}`, `<label>Message<textarea name="message" maxlength="400" placeholder="We'd love your help with…"></textarea></label>`,
+      'Send invite', async (v) => { await api(`/teams/${el.dataset.team}/invite`, { ...v, user_id: +el.dataset.user }); toast('Invite sent'); render(); });
+  },
+  async decide(el) {
+    const r = await api(`/requests/${el.dataset.id}`, { action: el.dataset.action });
+    toast({ accept: 'Accepted — welcome to the team!', decline: 'Declined', cancel: 'Withdrawn' }[el.dataset.action]);
+    await refreshMe();
+    if (el.dataset.action === 'accept' && location.hash.startsWith('#/inbox')) location.hash = `#/t/${r.team_id}`;
+    else render();
+  },
+  async leave(el) {
+    if (!confirm('Leave this team? If you are the last member, the team is deleted.')) return;
+    await api(`/teams/${el.dataset.id}/leave`, {});
+    await refreshMe();
+    toast('You left the team');
+    location.hash = `#/c/${el.dataset.c}`;
+  },
+  async vote(el) {
+    if (!me) { location.hash = '#/join'; return; }
+    const r = await api(`/submissions/${el.dataset.id}/vote`, {});
+    el.classList.toggle('on', r.voted);
+    el.querySelector('b').textContent = r.votes;
+  },
+};
+
+document.addEventListener('click', async (e) => {
+  const el = e.target.closest('[data-act]');
+  if (!el) return;
+  e.preventDefault();
+  try { await actions[el.dataset.act](el); } catch (err) { toast(err.message, true); }
+});
+
+// ---------- router ----------
+
+const routes = [
+  [/^$/, viewHome],
+  [/^challenges(?:\/(live|upcoming|past))?$/, viewChallenges],
+  [/^c\/(\d+)$/, viewChallenge],
+  [/^teams$/, viewTeams],
+  [/^t\/(\d+)$/, viewTeam],
+  [/^t\/(\d+)\/room$/, viewRoom],
+  [/^people$/, viewPeople],
+  [/^u\/([a-z0-9_-]+)$/, viewPerson],
+  [/^inbox$/, viewInbox],
+  [/^demos$/, viewDemos],
+  [/^floor$/, viewFloor],
+  [/^notifications$/, viewNotifications],
+  [/^judge$/, viewJudge],
+  [/^live(?:\/([a-z0-9-]+))?$/, viewLive],
+  [/^me$/, viewProfile],
+  [/^sponsor$/, viewSponsor],
+  [/^join$/, viewJoin],
+];
+
+// "My team" goes straight to the Team Room; with teams in several challenges it becomes a small menu.
+function myTeamNav() {
+  const teams = me?.teams || [];
+  if (!teams.length) return '';
+  const here = location.hash.match(/^#\/t\/(\d+)/)?.[1];
+  const active = teams.some((t) => String(t.id) === here) ? 'active' : '';
+  if (teams.length === 1) {
+    const t = teams[0];
+    return `<a href="#/t/${t.id}/room" class="my-team ${active}" title="${esc(t.name)} · ${esc(t.challenge_title)}">🚪 My team <span class="muted">· ${esc(t.name)}</span></a>`;
+  }
+  return `<details class="nav-menu ${active}"><summary class="my-team">🚪 My teams <span class="muted">· ${teams.length}</span></summary><div class="menu">
+    ${teams.map((t) => `<a href="#/t/${t.id}/room" class="${String(t.id) === here ? 'active' : ''}"><b>${esc(t.name)}</b><span class="small muted">${esc(t.challenge_title)}</span></a>`).join('')}
+  </div></details>`;
+}
+
+function renderNav() {
+  const path = location.hash.replace(/^#\/?/, '').split(/[/?]/)[0];
+  const link = (href, label, extra = '') =>
+    `<a href="#/${href}" class="${path === href.split('/')[0] ? 'active' : ''}">${label}${extra}</a>`;
+  let html = myTeamNav() + link('floor', '<span class="dot"></span>The Floor') + link('challenges', 'Challenges') + link('teams', 'Find a team') + link('demos', 'Demos') + link('people', 'Hackers') + link('sponsor', 'Sponsors');
+  if (me) {
+    if (me.role === 'judge') html += link('judge', 'Judging');
+    if (me.role === 'hacker') html += link('inbox', 'Inbox', me.inbox ? `<span class="badge">${me.inbox}</span>` : '');
+    html += link('notifications', '<span aria-label="Notifications">🔔</span>', me.unread ? `<span class="badge">${me.unread}</span>` : '');
+    html += link('me', `@${esc(me.handle)}`);
+  } else {
+    html += `<a href="#/join" class="btn sm" style="color:var(--accent-ink);background:var(--accent)">Join</a>`;
+  }
+  nav.innerHTML = html;
+}
+
+async function render() {
+  const seq = ++renderSeq;
+  clearInterval(floorTimer);
+  leaveRoom();
+  stopLive();
+  const [path, query] = location.hash.replace(/^#\/?/, '').split('?');
+  const params = new URLSearchParams(query || '');
+  nav.classList.remove('open');
+  renderNav();
+  const found = routes.find(([rx]) => rx.test(path));
+  if (!found) { app.innerHTML = empty('Page not found. <a href="#/">Go home</a>'); return; }
+  const args = path.match(found[0]).slice(1);
+  if (!app.innerHTML) app.innerHTML = '<div class="loading">Loading…</div>';
+  try {
+    // Views take their route captures (missing optional ones as undefined) followed by the query params.
+    const out = await found[1](...(args.length ? args : [params]), params);
+    if (seq !== renderSeq) return;
+    const [html, after] = Array.isArray(out) ? out : [out];
+    app.innerHTML = html;
+    if (after) after();
+  } catch (err) {
+    if (seq !== renderSeq) return;
+    if (err.status === 401) { location.hash = '#/join'; return; }
+    app.innerHTML = empty(esc(err.message));
+  }
+}
+
+let lastPath = null;
+window.addEventListener('hashchange', () => {
+  const path = location.hash.split('?')[0];
+  if (path !== lastPath) window.scrollTo(0, 0);
+  lastPath = path;
+  render();
+});
+
+// Poll for new notifications (demo going live, invites…) and surface them as a toast.
+setInterval(async () => {
+  if (!me || document.hidden) return;
+  const before = me.unread;
+  try { await refreshMe(); } catch { return; }
+  if (me && me.unread > before) {
+    const latest = (await api('/notifications')).notifications[0];
+    if (latest) toast(latest.text);
+  }
+}, 20000);
+
+startClock();
+refreshMe().catch(() => {}).finally(render);

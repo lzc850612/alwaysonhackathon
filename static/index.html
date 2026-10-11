@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Always-On Hackathon</title>
+  <meta name="description" content="There's always a hackathon happening. Find a team in minutes, ship something this week.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%237c5cff'/><circle cx='16' cy='16' r='6' fill='%23c6ff3d'/></svg>">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/"><span class="pulse" aria-hidden="true"></span>always-on<b>hackathon</b></a>
+    <button class="menu-btn" aria-label="Menu" data-act="menu">☰</button>
+    <nav id="nav"></nav>
+  </header>
+  <div id="clockbar" class="clockbar" aria-live="off"></div>
+  <main id="app" tabindex="-1"></main>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <footer class="foot">
+    <span>Always-On Hackathon · a community project · not affiliated with any hackathon league</span>
+    <a href="#/sponsor">For sponsors</a>
+  </footer>
+  <script src="/static/room.js"></script>
+  <script src="/static/live.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
